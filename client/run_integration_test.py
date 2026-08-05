@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-integration_test.py -- drive the browser-under-test through one update scenario and
+run_integration_testing.py -- drive the browser-under-test through one update scenario and
 report/assert the outcome. Does NOT run the update server; point --server at an already-
 running one (see test_update_server.py).
 
@@ -29,7 +29,7 @@ POST-INSTALL CHECK
     record instead -- e.g. dpkg-query on your package. See installed_version().
 
 USAGE
-    python integration_test.py \
+    python run_integration_testing.py \
         --browser /path/to/chrome \
         --server http://192.168.44.10:8080 \
         --variant ok \

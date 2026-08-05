@@ -1,65 +1,47 @@
 #!/usr/bin/env python3
 """
-test_update_server.py -- a payload-agnostic test update server for a Chromium-fork
-auto-updater. Standard library only. Serves pre-signed artifacts you upload; it does
-NOT sign anything. The self-test lives in selftest.py.
+test_update_server.py -- test update server for a Chromium-Gost auto-updater. Standard
+library only. Serves pre-signed artifacts you drop on disk; signs nothing. The self-test
+lives in selftest.py.
 
-WHO RUNS THIS
-    A "manage everything" driver script imports UpdateServer, calls .start() to get the
-    loopback URL, points the browser-under-test at it, then calls .stop(). You can also
-    run it standalone (python test_update_server.py) to serve until Ctrl-C.
+DISK LAYOUT (no paths hard-coded in this file -- only signatures)
+    artifacts/
+      <role>/
+        version.txt                 the role's version, e.g. 150.0.7871.212
+        <target>/<filename>         the installer, named by convention
 
-THE ONE PLACE THAT DEFINES YOUR WIRE FORMAT
-    build_response() is the single authority for the response document. Field NAMES are
-    the RESP_* constants. The signature and timestamp are strings you store in ARTIFACTS;
-    the server echoes them verbatim.
+    role     : current | newer | older
+    target   : windows | linux_deb | linux_rpm | macos
+    filename : chromium-gost-<version>-<suffix>, suffix by target:
+                 windows   -> windows-amd64-installer.exe
+                 linux_deb -> linux-amd64.deb
+                 linux_rpm -> linux-amd64.rpm
+                 macos     -> macos-arm64.tar.bz2
+    Per release you edit version.txt, drop the (conventionally named) file, and -- for the
+    check roles only -- paste the signature into ARTIFACTS below. Never a path here.
 
-AVAILABILITY IS COMPUTED (like production)
-    The server reads the version the browser reports (REQ_VERSION_FIELD) and returns
-    update_available only if the offered version is strictly newer. The one exception is
-    the `downgrade` variant: it sets force_available so the server offers an OLDER version
-    anyway (a downgrade offer is byte-identical to a normal one) -- that's what lets you
-    test the browser's downgrade rejection, which a healthy server would never trigger.
+ENDPOINTS
+    /<variant>/update                                   check (browser POSTs telemetry)
+    /<variant>/download-update/<role>/<target>/<file>   payload for the check flow
+    /download-current/<target>                          raw current installer (baseline
+                                                        setup for integration tests)
 
-RESPONSE SCHEMA (defaults -- rename freely via the RESP_* constants)
-    update-available:
-        {
-          "update_available": true,
-          "version": "999.0.0.0",
-          "download_url": "http://127.0.0.1:PORT/ok/download-update/newer/windows/mini_installer_126.exe",
-          "signature": "<the signature string stored in ARTIFACTS>",
-          "signature_timestamp": "23.11.2023"
-        }
-    no-update:
-        { "update_available": false }
+VARIANTS (check flow)
+    ok         newer version, valid            -> expect install
+    downgrade  older version, valid (forced)   -> browser must reject
+    corrupt    newer, one payload byte flipped -> signature check fails
+    truncated / badjson / http500 / hang       misbehaving responses
 
-REQUEST (telemetry)
-    Browser POSTs (or GETs, with query params) to /<variant>/update. The OS value must be
-    exactly one of OS_VALUES and the version must be a dotted number; anything else is a
-    400. Query-string params not part of the schema are ignored.
-
-VARIANTS (chosen by URL path prefix)
-    ok            newer version, valid                    -> expect install
-    noupdate      offers the reported version             -> expect no-op
-    downgrade     OLDER version, valid (forced offer)     -> browser must reject
-    corrupt       newer, one payload byte flipped after
-                  signing (see note below)                -> signature check fails
-    truncated     check response body cut short           -> HTTP robustness
-    badjson       malformed JSON                          -> parse robustness
-    http500       HTTP 500                                -> error handling
-    hang          accept, never respond                   -> client hard-timeout
-
-    The leading path segment IS the selector: point the browser at
-    http://HOST:PORT/<variant>; it appends /update and follows the returned download
-    link, all under the same /<variant> prefix. The downgrade test is just /downgrade.
+    update_available is computed (offered > reported) except downgrade, which forces the
+    offer. VERSION comes from version.txt; SIGNATURE + TIMESTAMP per check role/target
+    live in ARTIFACTS below (can't be derived).
 
 QUICK START
     python test_update_server.py                  # prints banner + preflight, serves
     python selftest.py --demo                      # exercise every variant with fakes
 """
 
-# TODO: fill in ARTIFACTS with your real signed files
-# TODO: sign browser binaries
+# TODO: fill in ARTIFACTS signatures with your real signed files
 
 from __future__ import annotations
 
@@ -85,144 +67,125 @@ RESP_URL_FIELD = "download_url"
 RESP_SIG_FIELD = "signature"
 RESP_TS_FIELD = "signature_timestamp"
 
-OS_VALUES = ("windows", "macOS", "linux")
+# target -> the trailing part of the standard filename
+TARGET_SUFFIX = {
+    "windows":   "windows-amd64-installer.exe",
+    "linux_deb": "linux-amd64.deb",
+    "linux_rpm": "linux-amd64.rpm",
+    "macos":     "macos-arm64.tar.bz2",
+}
+OS_VALUES = tuple(TARGET_SUFFIX)
+
+ALL_ROLES = ("current", "newer", "older")
+VERSION_FILE = "version.txt"
 
 CONFIG = {
     "artifacts_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts"),
     "hang_seconds": 3600,
 }
 
+# Signature + timestamp per check role/target. Versions and file paths are NOT here --
+# versions come from artifacts/<role>/version.txt, filenames are derived by convention.
+# `current` needs no signature (download-only), so it isn't listed.
 ARTIFACTS = {
-    "current": {
-        "version": "125.0.6422.60",
-        "platforms": {
-            OS_VALUES[0]: {
-                "file": "current/mini_installer_125.exe",
-                "signature": "",
-                "timestamp": "",
-            },
-            OS_VALUES[1]: {
-                "file": "current/Browser-125.zip",
-                "signature": "",
-                "timestamp": "",
-            },
-            OS_VALUES[2]: {
-                "file": "current/browser_125.deb",
-                "signature": "",
-                "timestamp": "",
-            },
-        },
-    },
     "newer": {
-        "version": "999.0.0.0",
-        "platforms": {
-            OS_VALUES[0]: {
-                "file": "newer/chromium-gost-999.0.0.0-windows-amd64-installer.exe",
-                "signature": "BC1DECA8C97114B1A8EC4A4E3C6F59CF290593F15D4D6EFC00F5ED83A57316A30B3AD96CE9FB50D0D1E80681A3922335DEE6B281B028E2533276DFAD2A649307",
-                "timestamp": "05.08.2026",
-            },
-            OS_VALUES[1]: {
-                "file": "newer/Browser-126.zip",
-                "signature": "",
-                "timestamp": "",
-            },
-            OS_VALUES[2]: {
-                "file": "newer/chromium-gost-stable_999.0.0.0-1_amd64.deb",
-                "signature": "8B58311EC89DE57A5D4F8FB9D8DE9E8BFA6205B036F58AD46E884C40DD7263C1A2854B60E33A9F1ACC2B2331D10C89963C16A8B98F517D9459185153BBC09951",
-                "timestamp": "03.08.2026",
-            },
+        "windows": {
+            "signature": "BC1DECA8C97114B1A8EC4A4E3C6F59CF290593F15D4D6EFC00F5ED83A57316A30B3AD96CE9FB50D0D1E80681A3922335DEE6B281B028E2533276DFAD2A649307",
+            "timestamp": "05.08.2026",
         },
+        "linux_deb": {
+            "signature": "8B58311EC89DE57A5D4F8FB9D8DE9E8BFA6205B036F58AD46E884C40DD7263C1A2854B60E33A9F1ACC2B2331D10C89963C16A8B98F517D9459185153BBC09951",
+            "timestamp": "03.08.2026",
+        },
+        "linux_rpm": {"signature": "", "timestamp": ""},
+        "macos":     {"signature": "", "timestamp": ""},
     },
     "older": {
-        "version": "124.0.6367.91",
-        "platforms": {
-            OS_VALUES[0]: {
-                "file": "older/mini_installer_124.exe",
-                "signature": "",
-                "timestamp": "",
-            },
-            OS_VALUES[1]: {
-                "file": "older/Browser-124.zip",
-                "signature": "",
-                "timestamp": "",
-            },
-            OS_VALUES[2]: {
-                "file": "older/browser_124.deb",
-                "signature": "",
-                "timestamp": "",
-            },
-        },
+        "windows":   {"signature": "", "timestamp": ""},
+        "linux_deb": {"signature": "", "timestamp": ""},
+        "linux_rpm": {"signature": "", "timestamp": ""},
+        "macos":     {"signature": "", "timestamp": ""},
     },
 }
 
 VARIANTS = {
-    "ok":           {"role": "newer"},
-    "noupdate":     {"role": "current"},
-    "downgrade":    {"role": "older", "force_available": True},
-    # corrupts payload bytes, not the signature -- see NOTE in the module docstring
-    "corrupt":      {"role": "newer", "corrupt_payload": True},
-    "truncated":    {"misbehave": "truncate"},
-    "badjson":      {"misbehave": "badjson"},
-    "http500":      {"misbehave": "http500"},
-    "hang":         {"misbehave": "hang"},
+    "ok":        {"role": "newer"},
+    "downgrade": {"role": "older", "force_available": True},
+    "corrupt":   {"role": "newer", "corrupt_payload": True},
+    "truncated": {"misbehave": "truncate"},
+    "badjson":   {"misbehave": "badjson"},
+    "http500":   {"misbehave": "http500"},
+    "hang":      {"misbehave": "hang"},
 }
+
+IS_WINDOWS = sys.platform.startswith("win")
 
 
 class ConfigError(Exception):
-    """Raised when a variant needs an artifact that ARTIFACTS/disk doesn't provide."""
+    """Raised when a request needs artifact data that disk/ARTIFACTS doesn't provide."""
 
 
 def _version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def _platform(role, os_key):
-    artifact = ARTIFACTS.get(role)
-    if not artifact:
-        raise ConfigError(f"no ARTIFACTS entry for role '{role}'")
-    platform = artifact.get("platforms", {}).get(os_key)
-    if not platform:
-        raise ConfigError(f"no entry for role '{role}', os '{os_key}'")
-    return artifact, platform
+def payload_filename(version, target):
+    """chromium-gost-<version>-<suffix> for the given target."""
+    return f"chromium-gost-{version}-{TARGET_SUFFIX[target]}"
 
 
-def _artifact_path(role, os_key):
-    _, platform = _platform(role, os_key)
-    relative_path = platform.get("file")
-    if not relative_path:
-        raise ConfigError(f"no file for role '{role}', os '{os_key}'")
-    path = (relative_path if os.path.isabs(relative_path)
-            else os.path.join(CONFIG["artifacts_dir"], relative_path))
+def role_version(role):
+    """The role's version, read from artifacts/<role>/version.txt."""
+    path = os.path.join(CONFIG["artifacts_dir"], role, VERSION_FILE)
     if not os.path.isfile(path):
-        raise ConfigError(f"artifact file missing on disk: {path}")
-    return path
+        raise ConfigError(f"missing version file: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        version = handle.read().strip()
+    if not version:
+        raise ConfigError(f"empty version file: {path}")
+    return version
 
 
-def _filename(role, os_key):
-    """The real filename (e.g. 'mini_installer_126.exe'), used both as the last URL
-    segment and in the Content-Disposition header, so a saved download keeps its
-    original name/extension instead of whatever the URL would otherwise end in."""
-    _, platform = _platform(role, os_key)
-    return os.path.basename(platform.get("file", "") or f"{role}-{os_key}")
+def payload_path(role, target):
+    """Absolute path to the role/target installer, plus its filename. Validates both the
+    target and that the file exists on disk."""
+    if target not in TARGET_SUFFIX:
+        raise ConfigError(f"unknown target '{target}'; expected one of {OS_VALUES}")
+    version = role_version(role)
+    filename = payload_filename(version, target)
+    path = os.path.join(CONFIG["artifacts_dir"], role, target, filename)
+    if not os.path.isfile(path):
+        raise ConfigError(f"payload missing on disk: {path}")
+    return path, filename
 
 
-def build_response(variant_name, variant, os_key, client_version, base_url):
+def signature_meta(role, target):
+    role_meta = ARTIFACTS.get(role)
+    if role_meta is None:
+        raise ConfigError(f"no signature metadata for role '{role}'")
+    meta = role_meta.get(target)
+    if meta is None:
+        raise ConfigError(f"no signature metadata for role '{role}', target '{target}'")
+    return meta
+
+
+def build_response(variant_name, variant, target, client_version, base_url):
     """Return the response document for a check. Edit THIS to match your real schema."""
     role = variant["role"]
-    artifact, platform = _platform(role, os_key)
-    offered_version = artifact["version"]
+    offered_version = role_version(role)
     available = (variant.get("force_available")
                  or _version_key(offered_version) > _version_key(client_version))
     if not available:
         return {RESP_AVAILABLE_FIELD: False}
-    _artifact_path(role, os_key)
-    filename = urllib.parse.quote(_filename(role, os_key))
+    _, filename = payload_path(role, target)
+    meta = signature_meta(role, target)
+    quoted = urllib.parse.quote(filename)
     return {
         RESP_AVAILABLE_FIELD: True,
         RESP_VERSION_FIELD: offered_version,
-        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{os_key}/{filename}",
-        RESP_SIG_FIELD: platform["signature"],
-        RESP_TS_FIELD: platform["timestamp"],
+        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{target}/{quoted}",
+        RESP_SIG_FIELD: meta["signature"],
+        RESP_TS_FIELD: meta["timestamp"],
     }
 
 
@@ -235,33 +198,42 @@ def _corrupt(data):
 
 
 def artifact_report():
-    """Return a list of (role, os_key, path, exists) for every configured artifact."""
+    """(role, target, version, path, exists) for every role/target; version None if the
+    role's version.txt is missing."""
     rows = []
-    for role, artifact in ARTIFACTS.items():
-        for os_key in OS_VALUES:
-            platform = artifact.get("platforms", {}).get(os_key)
-            if not platform:
-                rows.append((role, os_key, None, False))
+    for role in ALL_ROLES:
+        try:
+            version = role_version(role)
+        except ConfigError:
+            version = None
+        for target in OS_VALUES:
+            if version is None:
+                rows.append((role, target, None, None, False))
                 continue
-            relative_path = platform.get("file", "")
-            path = (relative_path if os.path.isabs(relative_path)
-                    else os.path.join(CONFIG["artifacts_dir"], relative_path))
-            rows.append((role, os_key, path, os.path.isfile(path)))
+            filename = payload_filename(version, target)
+            path = os.path.join(CONFIG["artifacts_dir"], role, target, filename)
+            rows.append((role, target, version, path, os.path.isfile(path)))
     return rows
 
 
 def print_artifact_report(file=sys.stdout):
-    rows = artifact_report()
-    width = max((len(f"{role}/{os_key}") for role, os_key, _, _ in rows), default=8)
     print(f"artifacts_dir = {CONFIG['artifacts_dir']}", file=file)
-    for role, os_key, path, exists in rows:
-        label = f"{role}/{os_key}".ljust(width)
+    rows = artifact_report()
+    width = max((len(f"{role}/{target}") for role, target, *_ in rows), default=8)
+    problems = 0
+    for role, target, version, path, exists in rows:
+        label = f"{role}/{target}".ljust(width)
+        if version is None:
+            print(f"  [NO VERSION] {label}  (missing {role}/{VERSION_FILE})", file=file)
+            problems += 1
+            continue
         status = "OK     " if exists else "MISSING"
-        print(f"  [{status}] {label}  {path}", file=file)
-    missing = sum(1 for *_, exists in rows if not exists)
-    if missing:
-        print(f"  -> {missing} of {len(rows)} artifact file(s) missing. Requests for "
-              f"those role/OS combinations will 500 until the files exist.", file=file)
+        if not exists:
+            problems += 1
+        print(f"  [{status}] {label}  v{version}  {path}", file=file)
+    if problems:
+        print(f"  -> {problems} problem(s); those role/target requests will 500 until fixed.",
+              file=file)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -282,8 +254,15 @@ class _Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path.strip("/")
         parts = path.split("/") if path else []
         if not parts or not parts[0]:
-            return self._plain(404, "expected /<variant>/update or "
-                                    "/<variant>/download-update/<role>/<os>")
+            return self._plain(404, "expected /<variant>/update, "
+                                    "/<variant>/download-update/<role>/<target>/<file>, "
+                                    "or /download-current/<target>")
+
+        if parts[0] == "download-current":
+            if len(parts) < 2:
+                return self._plain(404, "expected /download-current/<target>")
+            return self._serve_current(parts[1])
+
         variant_name = parts[0]
         variant = VARIANTS.get(variant_name)
         if variant is None:
@@ -297,19 +276,17 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_check(variant_name, variant)
         if endpoint == "download-update":
             if len(parts) < 4:
-                return self._plain(404, "download path is /<variant>/download-update/<role>/<os>"
-                                        "[/<filename>]")
-            # parts[4:], if present, is just the real filename for URL/save-as purposes;
-            # the actual file served is always resolved from role + os_key alone.
+                return self._plain(404, "download path is "
+                                        "/<variant>/download-update/<role>/<target>/<file>")
             return self._serve_download(variant, parts[2], parts[3])
-        return self._plain(404, "expected /update or /download-update/<role>/<os>[/<filename>]")
+        return self._plain(404, "expected /update or /download-update/<role>/<target>/<file>")
 
     def _serve_check(self, variant_name, variant):
         telemetry = self._read_telemetry()
         try:
-            os_key = self._os_key(telemetry)
+            target = self._target(telemetry)
             client_version = self._client_version(telemetry)
-            document = build_response(variant_name, variant, os_key, client_version,
+            document = build_response(variant_name, variant, target, client_version,
                                       self._request_base_url())
         except ConfigError as error:
             self._log_resolution(variant_name, telemetry, error)
@@ -320,27 +297,39 @@ class _Handler(BaseHTTPRequestHandler):
         self._log_resolution(variant_name, telemetry, document)
         self._send(200, "application/json", json.dumps(document, indent=2).encode("utf-8"))
 
-    def _serve_download(self, variant, role, os_key):
+    def _serve_download(self, variant, role, target):
         try:
-            path = _artifact_path(role, os_key)
+            path, filename = payload_path(role, target)
         except ConfigError as error:
-            self._log_resolution(f"download role={role}", {"os": os_key}, error)
+            self._log_resolution(f"download role={role}", {"target": target}, error)
             return self._plain(500, f"artifact/config not ready: {error}")
-        with open(path, "rb") as file_handle:
-            data = file_handle.read()
+        with open(path, "rb") as handle:
+            data = handle.read()
         if variant.get("corrupt_payload"):
             data = _corrupt(data)
-        filename = _filename(role, os_key)
-        self._log_resolution(f"download role={role}", {"os": os_key}, f"served {filename} ({len(data)}B)")
+        self._log_resolution(f"download role={role}", {"target": target},
+                             f"served {filename} ({len(data)}B)")
+        self._serve_bytes(data, filename)
+
+    def _serve_current(self, target):
+        try:
+            path, filename = payload_path("current", target)
+        except ConfigError as error:
+            self._log_resolution("download-current", {"target": target}, error)
+            status = 400 if "unknown target" in str(error) else 500
+            return self._plain(status, str(error))
+        with open(path, "rb") as handle:
+            data = handle.read()
+        self._log_resolution("download-current", {"target": target},
+                             f"served {filename} ({len(data)}B)")
+        self._serve_bytes(data, filename)
+
+    def _serve_bytes(self, data, filename):
         self._send(200, "application/octet-stream", data,
                    extra_headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-    def _log_resolution(self, variant_name, telemetry, outcome):
-        # Unconditional -- not gated by --quiet or --verbose. Every check and download
-        # request prints exactly what the server parsed and what it decided, success or
-        # failure, so nothing happens silently. --quiet suppresses only the framework's
-        # separate raw access-log line (see log_message below).
-        sys.stderr.write(f"[server] {variant_name} request={telemetry!r} -> {outcome!r}\n")
+    def _log_resolution(self, name, telemetry, outcome):
+        sys.stderr.write(f"[server] {name} request={telemetry!r} -> {outcome!r}\n")
 
     def _misbehave(self, misbehavior):
         if misbehavior == "http500":
@@ -350,14 +339,12 @@ class _Handler(BaseHTTPRequestHandler):
                     % (RESP_AVAILABLE_FIELD, RESP_VERSION_FIELD)).encode("utf-8")
             return self._send(200, "application/json", body)
         if misbehavior == "truncate":
-            newer_version = ARTIFACTS["newer"]["version"]
-            filename = urllib.parse.quote(_filename("newer", OS_VALUES[0]))
             sample = {
                 RESP_AVAILABLE_FIELD: True,
-                RESP_VERSION_FIELD: newer_version,
-                RESP_URL_FIELD: f"{self._request_base_url()}/ok/download-update/newer/{OS_VALUES[0]}/{filename}",
+                RESP_VERSION_FIELD: "999.0.0.0",
+                RESP_URL_FIELD: f"{self._request_base_url()}/ok/download-update/newer/{OS_VALUES[0]}/installer",
                 RESP_SIG_FIELD: "AAAA",
-                RESP_TS_FIELD: "23.11.2023",
+                RESP_TS_FIELD: "01.01.2024",
             }
             full = json.dumps(sample, indent=2).encode("utf-8")
             self.close_connection = True
@@ -389,7 +376,7 @@ class _Handler(BaseHTTPRequestHandler):
             fields.update(urllib.parse.parse_qs(body.decode("utf-8", "replace")))
         return {key: value[0] for key, value in fields.items() if value}
 
-    def _os_key(self, telemetry):
+    def _target(self, telemetry):
         value = telemetry.get(REQ_OS_FIELD)
         if value not in OS_VALUES:
             raise ValueError(f"missing or invalid '{REQ_OS_FIELD}'; expected one of {OS_VALUES}")
@@ -424,9 +411,6 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, fmt, *args):
-        # On by default -- this is the standard "METHOD path HTTP/1.1" status line.
-        # Pass --quiet to suppress it (the per-request _log_resolution line above stays
-        # on regardless, since that one carries the actually useful detail).
         if not getattr(self.server, "quiet", False):
             sys.stderr.write("[server] " + (fmt % args) + "\n")
 
@@ -447,11 +431,10 @@ class UpdateServer:
         server.stop()
     """
 
-    def __init__(self, host="127.0.0.1", port=0, verbose=False, quiet=False,
+    def __init__(self, host="127.0.0.1", port=0, quiet=False,
                  tls_cert=None, tls_key=None):
         self.host = host
         self.port = port
-        self.verbose = verbose
         self.quiet = quiet
         self.tls_cert = tls_cert
         self.tls_key = tls_key
@@ -469,7 +452,6 @@ class UpdateServer:
         self.base_url = f"{scheme}://{self.host}:{self.port}"
         http_server.base_url = self.base_url
         http_server.scheme = scheme
-        http_server.verbose = self.verbose
         http_server.quiet = self.quiet
         http_server.stop_event = threading.Event()
         self._http_server = http_server
@@ -494,19 +476,15 @@ class UpdateServer:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Test update server for a Chromium-fork updater.")
+    parser = argparse.ArgumentParser(description="Test update server for a Chromium-Gost updater.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--artifacts", default=None)
     parser.add_argument("--tls-cert", default=None)
     parser.add_argument("--tls-key", default=None)
-    parser.add_argument("--verbose", action="store_true",
-                        help="also print the raw 'METHOD path' access-log line "
-                             "(on by default; this flag is now a no-op, kept for "
-                             "backward compatibility)")
     parser.add_argument("--quiet", action="store_true",
-                        help="suppress the raw access-log line (the per-request "
-                             "resolution summary still prints regardless)")
+                        help="suppress the raw access-log line (per-request resolution "
+                             "summary still prints)")
     args = parser.parse_args(argv)
 
     if args.artifacts:
@@ -520,6 +498,7 @@ def main(argv=None):
     base_url = server.start()
     print(base_url, flush=True)
     print("variants: " + ", ".join(sorted(VARIANTS)), flush=True)
+    print("plus: /download-current/<target>", flush=True)
     print_artifact_report()
     print("Ctrl-C to stop.", flush=True)
     try:

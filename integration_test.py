@@ -63,6 +63,10 @@ WINDOWS_PV_VALUE = "pv"
 IS_WINDOWS = platform.system() == "Windows"
 BROWSER_PROCESS_NAMES = ("chrome", "chromium", "chromium-gost")
 
+# After the update lands, give the browser this long to relaunch, then confirm the
+# relaunched process is actually alive before tearing anything down.
+RELAUNCH_GRACE_SECONDS = 5.0
+
 
 # ----------------------------------------------------------------------------------------
 # Launch as a killable process group (captures the relaunch however it behaves)
@@ -161,6 +165,40 @@ def read_version_quietly(browser_path):
 
 
 # ----------------------------------------------------------------------------------------
+# Process observation -- confirm a relaunched browser is actually alive
+# ----------------------------------------------------------------------------------------
+
+def browser_pids():
+    """Best-effort set of running browser PIDs. Never raises; empty set if unavailable."""
+    try:
+        if IS_WINDOWS:
+            output = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                                    capture_output=True, text=True).stdout
+            pids = set()
+            for line in output.splitlines():
+                fields = [f.strip('"') for f in line.split('","')]
+                if fields and any(n in fields[0].lower() for n in BROWSER_PROCESS_NAMES):
+                    try:
+                        pids.add(int(fields[1]))
+                    except (IndexError, ValueError):
+                        pass
+            return pids
+        output = subprocess.run(["ps", "-eo", "pid=,comm="],
+                                capture_output=True, text=True).stdout
+        pids = set()
+        for line in output.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and any(n in parts[1].lower() for n in BROWSER_PROCESS_NAMES):
+                try:
+                    pids.add(int(parts[0]))
+                except ValueError:
+                    pass
+        return pids
+    except (FileNotFoundError, OSError):
+        return set()
+
+
+# ----------------------------------------------------------------------------------------
 # Poll until the installed version changes (bounded by the hard timeout)
 # ----------------------------------------------------------------------------------------
 
@@ -186,9 +224,11 @@ def wait_for_update(browser_path, start_version, expect_version, timeout, poll_i
 # One test case
 # ----------------------------------------------------------------------------------------
 
-def run_case(browser_path, server_url, variant, expect_version, timeout, poll_interval):
+def run_case(browser_path, server_url, variant, expect_version, timeout, poll_interval,
+             relaunch_grace):
     start_version = read_version_quietly(browser_path)
     print(f"version before update: {start_version}")
+    pids_before = browser_pids()
 
     process = start_browser(browser_path, server_url, variant)
     try:
@@ -196,20 +236,37 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
                                               timeout, poll_interval)
         print(f"version after update: {last_seen}")
 
-        if expect_version is not None:
-            if last_seen == expect_version:
-                print("\nRESULT: PASS")
-                return 0
-            print(f"\nRESULT: FAIL\n  - expected {expect_version}, "
-                  f"last saw {last_seen} within {timeout}s")
-            return 1
+        failures = []
 
-        if changed:
-            print(f"\nRESULT: PASS (version moved {start_version} -> {last_seen})")
-            return 0
-        print(f"\nRESULT: FAIL\n  - version never changed from {start_version} "
-              f"within {timeout}s")
-        return 1
+        # Version verdict.
+        if expect_version is not None:
+            if last_seen != expect_version:
+                failures.append(f"expected version {expect_version}, "
+                                f"last saw {last_seen} within {timeout}s")
+        elif not changed:
+            failures.append(f"version never changed from {start_version} within {timeout}s")
+
+        # Relaunch verdict: the update is on disk, but the whole point is that the browser
+        # comes BACK UP on it. Do NOT kill yet -- give it the grace period to relaunch,
+        # then confirm a browser process is actually alive.
+        print(f"waiting {relaunch_grace:.1f}s for relaunch...")
+        time.sleep(relaunch_grace)
+        pids_after = browser_pids()
+        new_pids = sorted(pids_after - pids_before)
+        alive = len(pids_after) > 0
+        print(f"browser processes alive after relaunch grace: {sorted(pids_after) or 'none'}")
+        print(f"new since launch: {new_pids or 'none'}")
+        if not alive:
+            failures.append(f"no browser process was alive {relaunch_grace:.1f}s after the "
+                            f"update -- browser did not relaunch (or exited)")
+
+        if failures:
+            print("\nRESULT: FAIL")
+            for failure in failures:
+                print(f"  - {failure}")
+            return 1
+        print(f"\nRESULT: PASS (version {start_version} -> {last_seen}, browser relaunched)")
+        return 0
     finally:
         kill_process_group(process)
 
@@ -225,10 +282,14 @@ def main(argv=None):
                         help="hard timeout in seconds for the update to land")
     parser.add_argument("--poll-interval", type=float, default=1.0,
                         help="seconds between version polls")
+    parser.add_argument("--relaunch-grace", type=float, default=RELAUNCH_GRACE_SECONDS,
+                        help="seconds to wait for relaunch (and let the window show) "
+                             "before confirming it's alive and tearing down")
     args = parser.parse_args(argv)
 
     return run_case(args.browser, args.server, args.variant,
-                    args.expect_version, args.timeout, args.poll_interval)
+                    args.expect_version, args.timeout, args.poll_interval,
+                    args.relaunch_grace)
 
 
 if __name__ == "__main__":

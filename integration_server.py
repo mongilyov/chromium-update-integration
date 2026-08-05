@@ -117,9 +117,9 @@ ARTIFACTS = {
         "version": "999.0.0.0",
         "platforms": {
             OS_VALUES[0]: {
-                "file": "newer/mini_installer_126.exe",
-                "signature": "",
-                "timestamp": "",
+                "file": "newer/chromium-gost-999.0.0.0-windows-amd64-installer.exe",
+                "signature": "BC1DECA8C97114B1A8EC4A4E3C6F59CF290593F15D4D6EFC00F5ED83A57316A30B3AD96CE9FB50D0D1E80681A3922335DEE6B281B028E2533276DFAD2A649307",
+                "timestamp": "05.08.2026",
             },
             OS_VALUES[1]: {
                 "file": "newer/Browser-126.zip",

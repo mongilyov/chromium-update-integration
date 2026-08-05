@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-selftest.py -- exercise every variant of the test update server with a plain HTTP client
-standing in for the browser. Confirms the server works and shows the real response schema
-without the full integration harness.
+selftest.py -- exercise every variant + /download-current against the test update server
+with a plain HTTP client standing in for the browser.
 
-    python selftest.py --demo            # generate throwaway fake artifacts, run all variants
+    python selftest.py --demo            # generate throwaway fake artifacts, run all
     python selftest.py --artifacts DIR   # run against real artifacts in DIR
 """
 
@@ -23,45 +22,42 @@ import urllib.request
 
 import test_update_server as server
 from test_update_server import (
-    OS_VALUES,
+    TARGETS,
     REQ_OS_FIELD,
+    REQ_INSTALLER_FIELD,
     REQ_VERSION_FIELD,
     RESP_AVAILABLE_FIELD,
     RESP_URL_FIELD,
     RESP_VERSION_FIELD,
+    payload_filename,
 )
 
-CLIENT_VERSION = "125.0.6422.60"
+CLIENT_VERSION = "150.0.7871.212"
+CLIENT_OS = "linux"
+CLIENT_INSTALLER = "deb"
 
-DEMO_FILENAMES = {
-    OS_VALUES[0]: "payload.exe",
-    OS_VALUES[1]: "payload.zip",
-    OS_VALUES[2]: "payload.deb",
+DEMO_VERSIONS = {
+    "current": "150.0.7871.212",
+    "newer":   "999.0.0.0",
+    "older":   "124.0.6367.91",
 }
 
 
 def _write_demo_artifacts(root):
-    plan = {
-        "current": ("125.0.6422.60", b"CURRENT-PAYLOAD-" * 64, "10.01.2024"),
-        "newer":   ("999.0.0.0",     b"NEWER-PAYLOAD-" * 64,   "15.05.2024"),
-        "older":   ("124.0.6367.91", b"OLDER-PAYLOAD-" * 64,   "02.09.2023"),
+    for role, version in DEMO_VERSIONS.items():
+        role_dir = os.path.join(root, role)
+        os.makedirs(role_dir, exist_ok=True)
+        with open(os.path.join(role_dir, "version.txt"), "w", encoding="utf-8") as handle:
+            handle.write(version + "\n")
+        for os_name, installer in TARGETS:
+            filename = payload_filename(version, os_name, installer)
+            with open(os.path.join(role_dir, filename), "wb") as handle:
+                handle.write(f"{role}-{os_name}-{installer}-PAYLOAD-".encode() * 64)
+    installers = sorted({installer for _, installer in TARGETS})
+    return {
+        "newer": {i: {"signature": f"DEMO-SIG-{i}", "timestamp": "15.05.2024"} for i in installers},
+        "older": {i: {"signature": f"DEMO-SIG-{i}", "timestamp": "02.09.2023"} for i in installers},
     }
-    artifacts = {}
-    for role, (version, payload, timestamp) in plan.items():
-        platforms = {}
-        for os_name, filename in DEMO_FILENAMES.items():
-            relative_path = os.path.join(role, os_name, filename)
-            full_path = os.path.join(root, relative_path)
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "wb") as file_handle:
-                file_handle.write(payload)
-            platforms[os_name] = {
-                "file": relative_path,
-                "signature": f"DEMO-SIG-OK-{os_name}",
-                "timestamp": timestamp,
-            }
-        artifacts[role] = {"version": version, "platforms": platforms}
-    return artifacts
 
 
 def _post(url, fields, timeout):
@@ -73,23 +69,35 @@ def _post(url, fields, timeout):
 
 def _get(url, timeout):
     with urllib.request.urlopen(url, timeout=timeout) as response:
-        return response.status, response.read()
+        return response.status, response.read(), response.headers
 
 
 def _check_bad_os(base_url):
-    label = f"{'bad-os':<13}"
+    label = f"{'bad-os':<14}"
     try:
         _post(f"{base_url}/ok/update",
-              {REQ_OS_FIELD: "nope", REQ_VERSION_FIELD: CLIENT_VERSION}, timeout=5)
+              {REQ_OS_FIELD: "nope", REQ_INSTALLER_FIELD: CLIENT_INSTALLER, REQ_VERSION_FIELD: CLIENT_VERSION}, timeout=5)
         print(f"{label} UNEXPECTED: accepted")
     except urllib.error.HTTPError as error:
-        print(f"{label} HTTP {error.code} (bad OS punished)")
+        print(f"{label} HTTP {error.code} (bad target punished)")
 
 
-def _check_variant(base_url, name):
+def _check_download_current(base_url):
+    label = f"{'download-current':<14}"
+    url = f"{base_url}/download-current/{CLIENT_OS}/{CLIENT_INSTALLER}"
+    try:
+        _, payload, headers = _get(url, timeout=5)
+        disposition = headers.get("Content-Disposition", "")
+        print(f"{label} {len(payload)}B, {disposition}")
+    except Exception as error:
+        print(f"{label} FAILED: {type(error).__name__}: {error}")
+
+
+def _check_variant(base_url, name, expect_version):
     check_url = f"{base_url}/{name}/update"
-    fields = {REQ_OS_FIELD: OS_VALUES[0], REQ_VERSION_FIELD: CLIENT_VERSION}
-    label = f"{name:<13}"
+    fields = {REQ_OS_FIELD: CLIENT_OS, REQ_INSTALLER_FIELD: CLIENT_INSTALLER,
+              REQ_VERSION_FIELD: CLIENT_VERSION}
+    label = f"{name:<14}"
 
     if name == "hang":
         start_time = time.time()
@@ -97,7 +105,7 @@ def _check_variant(base_url, name):
             _post(check_url, fields, timeout=1.5)
             print(f"{label} UNEXPECTED: got a response")
         except Exception:
-            print(f"{label} hung ~{time.time() - start_time:.1f}s then client timed out (expected)")
+            print(f"{label} hung ~{time.time() - start_time:.1f}s then timed out (expected)")
         return
     if name == "http500":
         try:
@@ -137,15 +145,16 @@ def _check_variant(base_url, name):
 
     version = document.get(RESP_VERSION_FIELD)
     try:
-        _, payload = _get(document.get(RESP_URL_FIELD), timeout=5)
-        download_note = f"downloaded {len(payload)}B"
+        _, payload, _ = _get(document.get(RESP_URL_FIELD), timeout=5)
+        note = f"downloaded {len(payload)}B"
         if name == "corrupt":
-            download_note += " (one byte flipped vs. signed original)"
+            note += " (byte flipped vs signed original)"
         if name == "downgrade":
-            download_note += " (server deliberately offered an older version)"
+            note += " (server deliberately offered older)"
     except Exception as error:
-        download_note = f"download FAILED: {type(error).__name__}"
-    print(f"{label} update->{version}; {download_note}")
+        note = f"download FAILED: {type(error).__name__}"
+    verdict = "" if version == expect_version else f"  [EXPECTED {expect_version}]"
+    print(f"{label} update->{version}; {note}{verdict}")
     if name in ("ok", "downgrade"):
         print(json.dumps(document, indent=2))
 
@@ -156,7 +165,6 @@ def main(argv=None):
     parser.add_argument("--artifacts", default=None)
     parser.add_argument("--demo", action="store_true",
                         help="generate throwaway fake payloads/sigs so all variants run")
-    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     temp_dir = None
@@ -167,17 +175,22 @@ def main(argv=None):
     elif args.artifacts:
         server.CONFIG["artifacts_dir"] = args.artifacts
 
-    update_server = server.UpdateServer(verbose=args.verbose)
+    update_server = server.UpdateServer(quiet=True)
     base_url = update_server.start()
     print(f"server: {base_url}")
     server.print_artifact_report()
     print(f"(client reports version {CLIENT_VERSION})\n")
 
-    order = ["ok", "noupdate", "downgrade", "corrupt",
-             "truncated", "badjson", "http500", "hang"]
+    expectations = {
+        "ok": DEMO_VERSIONS["newer"],
+        "downgrade": DEMO_VERSIONS["older"],
+        "corrupt": DEMO_VERSIONS["newer"],
+    }
+    order = ["ok", "downgrade", "corrupt", "truncated", "badjson", "http500", "hang"]
     try:
         for name in order:
-            _check_variant(base_url, name)
+            _check_variant(base_url, name, expectations.get(name))
+        _check_download_current(base_url)
         _check_bad_os(base_url)
     finally:
         update_server.stop()

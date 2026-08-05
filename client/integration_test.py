@@ -11,7 +11,7 @@ USAGE
         --browser /opt/chromium-gost/chrome \
         --server http://192.168.44.10:8080 \
         --variant ok \
-        [--expect-version 999.0.0.0] [--target linux_deb] [--package /path/to.deb]
+        [--expect-version 999.0.0.0] [--os linux] [--installer deb] [--package /path/to.deb]
         [--timeout 120] [--poll-interval 1.0] [--relaunch-grace 5.0] [--skip-prepare]
 
 Assumes root/Administrator (the prepare stage installs packages).
@@ -43,8 +43,10 @@ def main(argv=None):
     parser.add_argument("--variant", default="ok", help="server variant/role (ok, downgrade, ...)")
     parser.add_argument("--expect-version", default=None,
                         help="version the update should reach (passed to the run stage)")
-    parser.add_argument("--target", default=None,
-                        help="download-current target for prepare (defaults to this platform)")
+    parser.add_argument("--os", dest="os_name", default=None,
+                        help="download-current os for prepare (defaults to this platform)")
+    parser.add_argument("--installer", default=None,
+                        help="download-current installer for prepare (defaults to this platform)")
     parser.add_argument("--package", default=None,
                         help="local baseline package for prepare instead of download-current")
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -57,8 +59,10 @@ def main(argv=None):
     if not args.skip_prepare:
         prepare_command = [sys.executable, PREPARE_SCRIPT, "--server", args.server,
                            "--timeout", str(args.timeout)]
-        if args.target:
-            prepare_command += ["--target", args.target]
+        if args.os_name:
+            prepare_command += ["--os", args.os_name]
+        if args.installer:
+            prepare_command += ["--installer", args.installer]
         if args.package:
             prepare_command += ["--package", args.package]
         code = _run_stage("PREPARE", prepare_command)

@@ -4,27 +4,33 @@ test_update_server.py -- test update server for a Chromium-Gost auto-updater. St
 library only. Serves pre-signed artifacts you drop on disk; signs nothing. The self-test
 lives in selftest.py.
 
-DISK LAYOUT (no paths hard-coded in this file -- only signatures)
+DISK LAYOUT (flat -- no per-target subfolders, no paths hard-coded here except signatures)
     artifacts/
       <role>/
         version.txt                 the role's version, e.g. 150.0.7871.212
-        <target>/<filename>         the installer, named by convention
+        <filename>                  the installers, named by convention, sitting flat
 
-    role     : current | newer | older
-    target   : windows | linux_deb | linux_rpm | macos
-    filename : chromium-gost-<version>-<suffix>, suffix by target:
-                 windows   -> windows-amd64-installer.exe
-                 linux_deb -> linux-amd64.deb
-                 linux_rpm -> linux-amd64.rpm
-                 macos     -> macos-arm64.tar.bz2
-    Per release you edit version.txt, drop the (conventionally named) file, and -- for the
-    check roles only -- paste the signature into ARTIFACTS below. Never a path here.
+    role      : current | newer | older
+    os        : windows | linux | macos
+    installer : deb | rpm (linux) | exe (windows) | tar (macos)
+    filename  : chromium-gost-<version>-<os-arch><ext>
+                  os-arch: windows-amd64 | linux-amd64 | macos-arm64
+                  ext    : .deb | .rpm | -installer.exe | .tar.bz2
+                e.g. chromium-gost-999.0.0.0-linux-amd64.deb
+    Per release: edit version.txt, drop the (conventionally named) files into
+    artifacts/<role>/, and -- for the check roles only -- paste the signature into
+    ARTIFACTS below (keyed by installer). Never a path here.
+
+REQUEST (telemetry)
+    Browser sends os + installer + version. os must be one of the three, installer one of
+    the four; version must be dotted. Anything else is a 400.
 
 ENDPOINTS
-    /<variant>/update                                   check (browser POSTs telemetry)
-    /<variant>/download-update/<role>/<target>/<file>   payload for the check flow
-    /download-current/<target>                          raw current installer (baseline
-                                                        setup for integration tests)
+    /<variant>/update                                            check
+    /<variant>/download-update/<role>/<os>/<installer>/<file>    payload for the check flow
+    /download-current/<os>/<installer>                           raw current installer
+                                                                 (baseline for integration
+                                                                 tests)
 
 VARIANTS (check flow)
     ok         newer version, valid            -> expect install
@@ -33,7 +39,7 @@ VARIANTS (check flow)
     truncated / badjson / http500 / hang       misbehaving responses
 
     update_available is computed (offered > reported) except downgrade, which forces the
-    offer. VERSION comes from version.txt; SIGNATURE + TIMESTAMP per check role/target
+    offer. VERSION comes from version.txt; SIGNATURE + TIMESTAMP per check role/installer
     live in ARTIFACTS below (can't be derived).
 
 QUICK START
@@ -57,9 +63,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 REQ_OS_FIELD = "os"
+REQ_INSTALLER_FIELD = "installer"
 REQ_VERSION_FIELD = "version"
-REQ_ARCH_FIELD = "arch"
-REQ_CHANNEL_FIELD = "channel"
 
 RESP_AVAILABLE_FIELD = "update_available"
 RESP_VERSION_FIELD = "version"
@@ -67,14 +72,23 @@ RESP_URL_FIELD = "download_url"
 RESP_SIG_FIELD = "signature"
 RESP_TS_FIELD = "signature_timestamp"
 
-# target -> the trailing part of the standard filename
-TARGET_SUFFIX = {
-    "windows":   "windows-amd64-installer.exe",
-    "linux_deb": "linux-amd64.deb",
-    "linux_rpm": "linux-amd64.rpm",
-    "macos":     "macos-arm64.tar.bz2",
+OS_VALUES = ("windows", "linux", "macos")
+INSTALLER_VALUES = ("deb", "rpm", "exe", "tar")
+
+OS_ARCH = {
+    "windows": "windows-amd64",
+    "linux":   "linux-amd64",
+    "macos":   "macos-arm64",
 }
-OS_VALUES = tuple(TARGET_SUFFIX)
+INSTALLER_EXT = {
+    "deb": ".deb",
+    "rpm": ".rpm",
+    "exe": "-installer.exe",
+    "tar": ".tar.bz2",
+}
+
+# The (os, installer) pairs that actually exist, for preflight/reporting and demos.
+TARGETS = (("windows", "exe"), ("linux", "deb"), ("linux", "rpm"), ("macos", "tar"))
 
 ALL_ROLES = ("current", "newer", "older")
 VERSION_FILE = "version.txt"
@@ -84,27 +98,27 @@ CONFIG = {
     "hang_seconds": 3600,
 }
 
-# Signature + timestamp per check role/target. Versions and file paths are NOT here --
-# versions come from artifacts/<role>/version.txt, filenames are derived by convention.
-# `current` needs no signature (download-only), so it isn't listed.
+# Signature + timestamp per check role, keyed by installer. Versions and paths are NOT
+# here -- versions come from version.txt, filenames are derived. `current` is download-
+# only (no signature), so it isn't listed.
 ARTIFACTS = {
     "newer": {
         "windows": {
             "signature": "BC1DECA8C97114B1A8EC4A4E3C6F59CF290593F15D4D6EFC00F5ED83A57316A30B3AD96CE9FB50D0D1E80681A3922335DEE6B281B028E2533276DFAD2A649307",
             "timestamp": "05.08.2026",
         },
-        "linux_deb": {
+        "deb": {
             "signature": "8B58311EC89DE57A5D4F8FB9D8DE9E8BFA6205B036F58AD46E884C40DD7263C1A2854B60E33A9F1ACC2B2331D10C89963C16A8B98F517D9459185153BBC09951",
             "timestamp": "03.08.2026",
         },
-        "linux_rpm": {"signature": "", "timestamp": ""},
-        "macos":     {"signature": "", "timestamp": ""},
+        "rpm": {"signature": "", "timestamp": ""},
+        "tar": {"signature": "", "timestamp": ""},
     },
     "older": {
-        "windows":   {"signature": "", "timestamp": ""},
-        "linux_deb": {"signature": "", "timestamp": ""},
-        "linux_rpm": {"signature": "", "timestamp": ""},
-        "macos":     {"signature": "", "timestamp": ""},
+        "exe": {"signature": "", "timestamp": ""},
+        "deb": {"signature": "", "timestamp": ""},
+        "rpm": {"signature": "", "timestamp": ""},
+        "tar": {"signature": "", "timestamp": ""},
     },
 }
 
@@ -118,8 +132,6 @@ VARIANTS = {
     "hang":      {"misbehave": "hang"},
 }
 
-IS_WINDOWS = sys.platform.startswith("win")
-
 
 class ConfigError(Exception):
     """Raised when a request needs artifact data that disk/ARTIFACTS doesn't provide."""
@@ -129,9 +141,13 @@ def _version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def payload_filename(version, target):
-    """chromium-gost-<version>-<suffix> for the given target."""
-    return f"chromium-gost-{version}-{TARGET_SUFFIX[target]}"
+def payload_filename(version, os_name, installer):
+    """chromium-gost-<version>-<os-arch><ext>."""
+    if os_name not in OS_ARCH:
+        raise ConfigError(f"unknown os '{os_name}'; expected one of {OS_VALUES}")
+    if installer not in INSTALLER_EXT:
+        raise ConfigError(f"unknown installer '{installer}'; expected one of {INSTALLER_VALUES}")
+    return f"chromium-gost-{version}-{OS_ARCH[os_name]}{INSTALLER_EXT[installer]}"
 
 
 def role_version(role):
@@ -146,30 +162,27 @@ def role_version(role):
     return version
 
 
-def payload_path(role, target):
-    """Absolute path to the role/target installer, plus its filename. Validates both the
-    target and that the file exists on disk."""
-    if target not in TARGET_SUFFIX:
-        raise ConfigError(f"unknown target '{target}'; expected one of {OS_VALUES}")
+def payload_path(role, os_name, installer):
+    """Absolute path to the installer (flat under the role dir), plus its filename."""
     version = role_version(role)
-    filename = payload_filename(version, target)
-    path = os.path.join(CONFIG["artifacts_dir"], role, target, filename)
+    filename = payload_filename(version, os_name, installer)
+    path = os.path.join(CONFIG["artifacts_dir"], role, filename)
     if not os.path.isfile(path):
         raise ConfigError(f"payload missing on disk: {path}")
     return path, filename
 
 
-def signature_meta(role, target):
+def signature_meta(role, installer):
     role_meta = ARTIFACTS.get(role)
     if role_meta is None:
         raise ConfigError(f"no signature metadata for role '{role}'")
-    meta = role_meta.get(target)
+    meta = role_meta.get(installer)
     if meta is None:
-        raise ConfigError(f"no signature metadata for role '{role}', target '{target}'")
+        raise ConfigError(f"no signature metadata for role '{role}', installer '{installer}'")
     return meta
 
 
-def build_response(variant_name, variant, target, client_version, base_url):
+def build_response(variant_name, variant, os_name, installer, client_version, base_url):
     """Return the response document for a check. Edit THIS to match your real schema."""
     role = variant["role"]
     offered_version = role_version(role)
@@ -177,13 +190,13 @@ def build_response(variant_name, variant, target, client_version, base_url):
                  or _version_key(offered_version) > _version_key(client_version))
     if not available:
         return {RESP_AVAILABLE_FIELD: False}
-    _, filename = payload_path(role, target)
-    meta = signature_meta(role, target)
+    _, filename = payload_path(role, os_name, installer)
+    meta = signature_meta(role, installer)
     quoted = urllib.parse.quote(filename)
     return {
         RESP_AVAILABLE_FIELD: True,
         RESP_VERSION_FIELD: offered_version,
-        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{target}/{quoted}",
+        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{os_name}/{installer}/{quoted}",
         RESP_SIG_FIELD: meta["signature"],
         RESP_TS_FIELD: meta["timestamp"],
     }
@@ -198,31 +211,31 @@ def _corrupt(data):
 
 
 def artifact_report():
-    """(role, target, version, path, exists) for every role/target; version None if the
-    role's version.txt is missing."""
+    """(role, os, installer, path, exists) for every role/target; version None missing."""
     rows = []
     for role in ALL_ROLES:
         try:
             version = role_version(role)
         except ConfigError:
             version = None
-        for target in OS_VALUES:
+        for os_name, installer in TARGETS:
             if version is None:
-                rows.append((role, target, None, None, False))
+                rows.append((role, os_name, installer, None, None, False))
                 continue
-            filename = payload_filename(version, target)
-            path = os.path.join(CONFIG["artifacts_dir"], role, target, filename)
-            rows.append((role, target, version, path, os.path.isfile(path)))
+            filename = payload_filename(version, os_name, installer)
+            path = os.path.join(CONFIG["artifacts_dir"], role, filename)
+            rows.append((role, os_name, installer, version, path, os.path.isfile(path)))
     return rows
 
 
 def print_artifact_report(file=sys.stdout):
     print(f"artifacts_dir = {CONFIG['artifacts_dir']}", file=file)
     rows = artifact_report()
-    width = max((len(f"{role}/{target}") for role, target, *_ in rows), default=8)
+    width = max((len(f"{role}/{os_name}/{installer}") for role, os_name, installer, *_ in rows),
+                default=8)
     problems = 0
-    for role, target, version, path, exists in rows:
-        label = f"{role}/{target}".ljust(width)
+    for role, os_name, installer, version, path, exists in rows:
+        label = f"{role}/{os_name}/{installer}".ljust(width)
         if version is None:
             print(f"  [NO VERSION] {label}  (missing {role}/{VERSION_FILE})", file=file)
             problems += 1
@@ -232,8 +245,7 @@ def print_artifact_report(file=sys.stdout):
             problems += 1
         print(f"  [{status}] {label}  v{version}  {path}", file=file)
     if problems:
-        print(f"  -> {problems} problem(s); those role/target requests will 500 until fixed.",
-              file=file)
+        print(f"  -> {problems} problem(s); those requests will 500 until fixed.", file=file)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -255,13 +267,13 @@ class _Handler(BaseHTTPRequestHandler):
         parts = path.split("/") if path else []
         if not parts or not parts[0]:
             return self._plain(404, "expected /<variant>/update, "
-                                    "/<variant>/download-update/<role>/<target>/<file>, "
-                                    "or /download-current/<target>")
+                                    "/<variant>/download-update/<role>/<os>/<installer>/<file>, "
+                                    "or /download-current/<os>/<installer>")
 
         if parts[0] == "download-current":
-            if len(parts) < 2:
-                return self._plain(404, "expected /download-current/<target>")
-            return self._serve_current(parts[1])
+            if len(parts) < 3:
+                return self._plain(404, "expected /download-current/<os>/<installer>")
+            return self._serve_current(parts[1], parts[2])
 
         variant_name = parts[0]
         variant = VARIANTS.get(variant_name)
@@ -275,19 +287,21 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._misbehave(misbehavior)
             return self._serve_check(variant_name, variant)
         if endpoint == "download-update":
-            if len(parts) < 4:
+            if len(parts) < 5:
                 return self._plain(404, "download path is "
-                                        "/<variant>/download-update/<role>/<target>/<file>")
-            return self._serve_download(variant, parts[2], parts[3])
-        return self._plain(404, "expected /update or /download-update/<role>/<target>/<file>")
+                                        "/<variant>/download-update/<role>/<os>/<installer>/<file>")
+            return self._serve_download(variant, parts[2], parts[3], parts[4])
+        return self._plain(404, "expected /update or "
+                                "/download-update/<role>/<os>/<installer>/<file>")
 
     def _serve_check(self, variant_name, variant):
         telemetry = self._read_telemetry()
         try:
-            target = self._target(telemetry)
+            os_name = self._pick(telemetry, REQ_OS_FIELD, OS_VALUES)
+            installer = self._pick(telemetry, REQ_INSTALLER_FIELD, INSTALLER_VALUES)
             client_version = self._client_version(telemetry)
-            document = build_response(variant_name, variant, target, client_version,
-                                      self._request_base_url())
+            document = build_response(variant_name, variant, os_name, installer,
+                                      client_version, self._request_base_url())
         except ConfigError as error:
             self._log_resolution(variant_name, telemetry, error)
             return self._plain(500, f"artifact/config not ready: {error}")
@@ -297,30 +311,30 @@ class _Handler(BaseHTTPRequestHandler):
         self._log_resolution(variant_name, telemetry, document)
         self._send(200, "application/json", json.dumps(document, indent=2).encode("utf-8"))
 
-    def _serve_download(self, variant, role, target):
+    def _serve_download(self, variant, role, os_name, installer):
         try:
-            path, filename = payload_path(role, target)
+            path, filename = payload_path(role, os_name, installer)
         except ConfigError as error:
-            self._log_resolution(f"download role={role}", {"target": target}, error)
+            self._log_resolution(f"download role={role}", {"os": os_name, "installer": installer}, error)
             return self._plain(500, f"artifact/config not ready: {error}")
         with open(path, "rb") as handle:
             data = handle.read()
         if variant.get("corrupt_payload"):
             data = _corrupt(data)
-        self._log_resolution(f"download role={role}", {"target": target},
+        self._log_resolution(f"download role={role}", {"os": os_name, "installer": installer},
                              f"served {filename} ({len(data)}B)")
         self._serve_bytes(data, filename)
 
-    def _serve_current(self, target):
+    def _serve_current(self, os_name, installer):
         try:
-            path, filename = payload_path("current", target)
+            path, filename = payload_path("current", os_name, installer)
         except ConfigError as error:
-            self._log_resolution("download-current", {"target": target}, error)
-            status = 400 if "unknown target" in str(error) else 500
+            self._log_resolution("download-current", {"os": os_name, "installer": installer}, error)
+            status = 400 if "unknown" in str(error) else 500
             return self._plain(status, str(error))
         with open(path, "rb") as handle:
             data = handle.read()
-        self._log_resolution("download-current", {"target": target},
+        self._log_resolution("download-current", {"os": os_name, "installer": installer},
                              f"served {filename} ({len(data)}B)")
         self._serve_bytes(data, filename)
 
@@ -342,7 +356,7 @@ class _Handler(BaseHTTPRequestHandler):
             sample = {
                 RESP_AVAILABLE_FIELD: True,
                 RESP_VERSION_FIELD: "999.0.0.0",
-                RESP_URL_FIELD: f"{self._request_base_url()}/ok/download-update/newer/{OS_VALUES[0]}/installer",
+                RESP_URL_FIELD: f"{self._request_base_url()}/ok/download-update/newer/linux/deb/installer",
                 RESP_SIG_FIELD: "AAAA",
                 RESP_TS_FIELD: "01.01.2024",
             }
@@ -376,10 +390,10 @@ class _Handler(BaseHTTPRequestHandler):
             fields.update(urllib.parse.parse_qs(body.decode("utf-8", "replace")))
         return {key: value[0] for key, value in fields.items() if value}
 
-    def _target(self, telemetry):
-        value = telemetry.get(REQ_OS_FIELD)
-        if value not in OS_VALUES:
-            raise ValueError(f"missing or invalid '{REQ_OS_FIELD}'; expected one of {OS_VALUES}")
+    def _pick(self, telemetry, field, allowed):
+        value = telemetry.get(field)
+        if value not in allowed:
+            raise ValueError(f"missing or invalid '{field}'; expected one of {allowed}")
         return value
 
     def _client_version(self, telemetry):
@@ -498,7 +512,7 @@ def main(argv=None):
     base_url = server.start()
     print(base_url, flush=True)
     print("variants: " + ", ".join(sorted(VARIANTS)), flush=True)
-    print("plus: /download-current/<target>", flush=True)
+    print("plus: /download-current/<os>/<installer>", flush=True)
     print_artifact_report()
     print("Ctrl-C to stop.", flush=True)
     try:

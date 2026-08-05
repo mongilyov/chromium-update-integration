@@ -10,9 +10,9 @@ Assumes root/Administrator -- apt remove/install require it.
 
 USAGE
     python prepare_integration_testing.py --server http://HOST:PORT
-        [--target linux_deb] [--package /path/to/local.deb]
+        [--os linux] [--installer deb] [--package /path/to/local.deb]
 
-    --target   defaults to the current platform's target (Linux -> linux_deb).
+    --os/--installer  default to this platform (Linux -> linux/deb).
     --package  install this local file instead of fetching /download-current.
 """
 
@@ -31,15 +31,42 @@ import urllib.request
 # Package to remove (and that the baseline install provides). Adjust to your package name.
 PACKAGE_NAME = "chromium-gost-stable"
 
-TARGET_BY_SYSTEM = {
-    "Linux": "linux_deb",
+OS_BY_SYSTEM = {
+    "Linux": "linux",
     "Windows": "windows",
     "Darwin": "macos",
 }
+DEFAULT_INSTALLER_BY_SYSTEM = {
+    "Linux": "deb",
+    "Windows": "exe",
+    "Darwin": "tar",
+}
 
 
-def default_target():
-    return TARGET_BY_SYSTEM.get(platform.system())
+def default_os():
+    return OS_BY_SYSTEM.get(platform.system())
+
+
+def default_installer():
+    return DEFAULT_INSTALLER_BY_SYSTEM.get(platform.system())
+
+
+def normalize_server_url(server_url):
+    """Accept 'host:port' as well as 'http://host:port' -- urllib needs the scheme, so
+    default a missing one to http://."""
+    if not server_url:
+        return server_url
+    if "://" not in server_url:
+        return "http://" + server_url
+    return server_url
+
+
+def require_root():
+    """apt remove/install need root. Fail early and clearly if we're not root, rather
+    than deep inside an apt call. No-op on platforms without geteuid (e.g. Windows)."""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() != 0:
+        raise RuntimeError("must run as root (use sudo) -- apt remove/install need it")
 
 
 # ----------------------------------------------------------------------------------------
@@ -84,8 +111,8 @@ def _filename_from_disposition(disposition):
     return match.group(1) if match else None
 
 
-def download_baseline(server_url, target, dest_dir, timeout):
-    url = f"{server_url.rstrip('/')}/download-current/{target}"
+def download_baseline(server_url, os_name, installer, dest_dir, timeout):
+    url = f"{server_url.rstrip('/')}/download-current/{os_name}/{installer}"
     print(f"downloading baseline from {url} ...")
     with urllib.request.urlopen(url, timeout=timeout) as response:
         disposition = response.headers.get("Content-Disposition", "")
@@ -127,7 +154,7 @@ def _install_linux(package_path):
 
 # ----------------------------------------------------------------------------------------
 
-def prepare(server_url, target, package, timeout):
+def prepare(server_url, os_name, installer, package, timeout):
     remove_current()
     if package:
         install(os.path.abspath(package))
@@ -135,7 +162,7 @@ def prepare(server_url, target, package, timeout):
         if not server_url:
             raise ValueError("need --server (to fetch the baseline) or --package")
         with tempfile.TemporaryDirectory(prefix="prepare-baseline-") as tmp:
-            baseline = download_baseline(server_url, target, tmp, timeout)
+            baseline = download_baseline(server_url, os_name, installer, tmp, timeout)
             install(baseline)
     print("baseline prepared")
 
@@ -145,22 +172,25 @@ def main(argv=None):
         description="Remove the current browser and install the baseline for testing.")
     parser.add_argument("--server", default=None,
                         help="base URL of the running update server (for /download-current)")
-    parser.add_argument("--target", default=None,
-                        help="download-current target; defaults to this platform's")
+    parser.add_argument("--os", dest="os_name", default=None,
+                        help="download-current os; defaults to this platform's")
+    parser.add_argument("--installer", default=None,
+                        help="download-current installer; defaults to this platform's")
     parser.add_argument("--package", default=None,
                         help="install this local package instead of fetching from --server")
     parser.add_argument("--timeout", type=float, default=120.0,
                         help="hard timeout for the baseline download")
     args = parser.parse_args(argv)
 
-    target = args.target or default_target()
-    if target is None and not args.package:
-        print(f"could not determine a target for platform '{platform.system()}'; "
-              f"pass --target", file=sys.stderr)
+    os_name = args.os_name or default_os()
+    installer = args.installer or default_installer()
+    if (os_name is None or installer is None) and not args.package:
+        print(f"could not determine os/installer for platform '{platform.system()}'; "
+              f"pass --os and --installer", file=sys.stderr)
         return 2
 
     try:
-        prepare(args.server, target, args.package, args.timeout)
+        prepare(args.server, os_name, installer, args.package, args.timeout)
     except NotImplementedError as error:
         print(f"NOT IMPLEMENTED: {error}", file=sys.stderr)
         return 3

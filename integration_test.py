@@ -6,31 +6,34 @@ running one (see test_update_server.py).
 
 WHAT IT DOES
     Launches, once, identically on every platform:
-        <browser> --update-and-exit --update-server='<server>/<variant>'
+        <browser> --update-now --update-server='<server>/<variant>'
     The browser downloads, verifies, installs (dpkg on Linux, mini_installer on Windows,
     folder swap on macOS -- all BEFORE relaunch), then relaunches into a live window.
 
-    We do NOT assume how the relaunch behaves (same process / new child / detached). The
-    browser is started in its own process GROUP, so whatever it spawns is captured. The
-    test:
-      1. launches in its own process group,
-      2. waits a bounded "settle" period for install+relaunch to finish,
-      3. reads the installed version out-of-band (the update already happened on disk),
-      4. kills the whole group so nothing lingers,
-      5. prints what it observed about the process(es) so the relaunch behavior is
-         visible from real output rather than guessed.
-    If --expect-version is given, the discovered version is asserted against it.
+    The install takes real time (download + verify + package tooling), so the test does
+    NOT sleep a fixed amount and then look -- that races the updater. Instead it:
+      1. records the version BEFORE launching,
+      2. launches in its own process GROUP (so the relaunch, however it behaves -- same
+         process / new child / detached -- is captured and killable),
+      3. POLLS the installed version until it changes from the starting value (or matches
+         --expect-version, if given), bounded by a HARD timeout,
+      4. only then kills the whole group to tear down the relaunched window.
+    The browser is never killed until the update has demonstrably landed or the timeout
+    genuinely expires.
 
 POST-INSTALL CHECK
     Linux / macOS: <browser> --version. Windows: --version is a no-op, so read Omaha's
     "pv" value from the registry. Both are isolated in installed_version().
+    NOTE: if `<browser> --version` reports a fixed base-Chromium string that does not
+    change on update (some forks do this), switch the Linux/macOS reader to the install
+    record instead -- e.g. dpkg-query on your package. See installed_version().
 
 USAGE
     python integration_test.py \
         --browser /path/to/chrome \
         --server http://192.168.44.10:8080 \
         --variant ok \
-        [--expect-version 999.0.0.0] [--settle 2.0] [--timeout 120]
+        [--expect-version 999.0.0.0] [--timeout 120] [--poll-interval 1.0]
 
 WHAT YOU FILL IN
     - WINDOWS_PV_KEY / WINDOWS_PV_VALUE: registry location of your build's version.
@@ -83,8 +86,6 @@ def start_browser(browser_path, server_url, variant):
 
 def kill_process_group(process):
     """Tear down the browser and whatever it relaunched. Best-effort; never raises."""
-    if process.poll() is not None and IS_WINDOWS:
-        return
     try:
         if IS_WINDOWS:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
@@ -98,41 +99,6 @@ def kill_process_group(process):
                 os.killpg(group, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         pass
-
-
-# ----------------------------------------------------------------------------------------
-# Process observation (so the relaunch behavior is visible, not guessed)
-# ----------------------------------------------------------------------------------------
-
-def browser_pids():
-    """Best-effort set of running browser PIDs, for before/after comparison. Never raises;
-    returns an empty set if the platform tool isn't available."""
-    try:
-        if IS_WINDOWS:
-            output = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                                    capture_output=True, text=True).stdout
-            pids = set()
-            for line in output.splitlines():
-                fields = [f.strip('"') for f in line.split('","')]
-                if fields and any(n in fields[0].lower() for n in BROWSER_PROCESS_NAMES):
-                    try:
-                        pids.add(int(fields[1]))
-                    except (IndexError, ValueError):
-                        pass
-            return pids
-        output = subprocess.run(["ps", "-eo", "pid=,comm="],
-                                capture_output=True, text=True).stdout
-        pids = set()
-        for line in output.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) == 2 and any(n in parts[1].lower() for n in BROWSER_PROCESS_NAMES):
-                try:
-                    pids.add(int(parts[0]))
-                except ValueError:
-                    pass
-        return pids
-    except (FileNotFoundError, OSError):
-        return set()
 
 
 # ----------------------------------------------------------------------------------------
@@ -186,40 +152,64 @@ def _installed_version_windows():
     raise RuntimeError("registry version not found; tried: " + ", ".join(tried))
 
 
+def read_version_quietly(browser_path):
+    """installed_version() but returns None instead of raising, for use while polling."""
+    try:
+        return installed_version(browser_path)
+    except RuntimeError:
+        return None
+
+
+# ----------------------------------------------------------------------------------------
+# Poll until the installed version changes (bounded by the hard timeout)
+# ----------------------------------------------------------------------------------------
+
+def wait_for_update(browser_path, start_version, expect_version, timeout, poll_interval):
+    """Poll until the version changes off start_version (or equals expect_version, if
+    given), or timeout. Returns (changed, last_seen). Never blocks past `timeout`."""
+    deadline = time.monotonic() + timeout
+    last_seen = start_version
+    while time.monotonic() < deadline:
+        current = read_version_quietly(browser_path)
+        if current is not None:
+            last_seen = current
+            if expect_version is not None:
+                if current == expect_version:
+                    return True, current
+            elif current != start_version:
+                return True, current
+        time.sleep(poll_interval)
+    return False, last_seen
+
+
 # ----------------------------------------------------------------------------------------
 # One test case
 # ----------------------------------------------------------------------------------------
 
-def run_case(browser_path, server_url, variant, expect_version, settle, timeout):
-    before = browser_pids()
+def run_case(browser_path, server_url, variant, expect_version, timeout, poll_interval):
+    start_version = read_version_quietly(browser_path)
+    print(f"version before update: {start_version}")
+
     process = start_browser(browser_path, server_url, variant)
-    launched_pid = process.pid
     try:
-        # Give install + relaunch a bounded moment to finish. Install precedes relaunch,
-        # so the on-disk version is authoritative by the end of this window.
-        time.sleep(min(settle, timeout))
+        changed, last_seen = wait_for_update(browser_path, start_version, expect_version,
+                                              timeout, poll_interval)
+        print(f"version after update: {last_seen}")
 
-        # Observe what actually happened to the process tree, and report it.
-        original_alive = process.poll() is None
-        after = browser_pids()
-        new_pids = sorted(after - before - {launched_pid})
-        print(f"launched pid: {launched_pid}")
-        print(f"original process still alive after {settle:.1f}s: {original_alive}")
-        print(f"new browser pids that appeared: {new_pids or 'none detected'}")
-
-        try:
-            found = installed_version(browser_path)
-        except RuntimeError as error:
-            print(f"\nRESULT: FAIL\n  - could not read installed version: {error}")
+        if expect_version is not None:
+            if last_seen == expect_version:
+                print("\nRESULT: PASS")
+                return 0
+            print(f"\nRESULT: FAIL\n  - expected {expect_version}, "
+                  f"last saw {last_seen} within {timeout}s")
             return 1
 
-        print(f"installed version: {found}")
-
-        if expect_version is not None and found != expect_version:
-            print(f"\nRESULT: FAIL\n  - expected {expect_version}, got {found}")
-            return 1
-        print("\nRESULT: PASS")
-        return 0
+        if changed:
+            print(f"\nRESULT: PASS (version moved {start_version} -> {last_seen})")
+            return 0
+        print(f"\nRESULT: FAIL\n  - version never changed from {start_version} "
+              f"within {timeout}s")
+        return 1
     finally:
         kill_process_group(process)
 
@@ -230,15 +220,15 @@ def main(argv=None):
     parser.add_argument("--server", required=True, help="base URL of a running update server")
     parser.add_argument("--variant", default="ok", help="server variant/role (ok, downgrade, ...)")
     parser.add_argument("--expect-version", default=None,
-                        help="if given, assert the installed version equals this")
-    parser.add_argument("--settle", type=float, default=2.0,
-                        help="seconds to wait for install+relaunch before reading the version")
+                        help="if given, wait for exactly this version; else wait for any change")
     parser.add_argument("--timeout", type=float, default=120.0,
-                        help="hard cap in seconds on the settle wait")
+                        help="hard timeout in seconds for the update to land")
+    parser.add_argument("--poll-interval", type=float, default=1.0,
+                        help="seconds between version polls")
     args = parser.parse_args(argv)
 
     return run_case(args.browser, args.server, args.variant,
-                    args.expect_version, args.settle, args.timeout)
+                    args.expect_version, args.timeout, args.poll_interval)
 
 
 if __name__ == "__main__":

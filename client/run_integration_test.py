@@ -53,7 +53,7 @@ import sys
 import time
 
 
-BROWSER_UPDATE_FLAG = "--update-now"
+BROWSER_UPDATE_FLAG = "--update-silent --update-without-timeout"
 BROWSER_SERVER_FLAG = "--update-server"   # passed as --update-server='<server>/<variant>'
 BROWSER_VERSION_FLAG = "--version"
 

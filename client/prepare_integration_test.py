@@ -106,6 +106,16 @@ class WindowsPlatform(Platform):
     UNINSTALL_STRING_VALUE = "UninstallString"
     UNINSTALL_ARGS_VALUE = "UninstallArguments"
 
+    # Appended after the registry's own args so the uninstall runs without the confirmation
+    # GUI. --force-uninstall suppresses the dialog; it does NOT wipe user data (that would
+    # be --delete-profile, deliberately left out).
+    UNINSTALL_FLAGS = ["--force-uninstall"]
+
+    # Chromium/Omaha setup.exe exit codes that mean "it worked" (0) or "worked, but a
+    # reboot is needed to finish deleting some files" -- both are successful uninstalls,
+    # not failures. 19 = UNINSTALL_REQUIRES_REBOOT.
+    UNINSTALL_OK_CODES = {0, 19}
+
     INSTALL_FLAGS = ["--silent", "--do-not-launch-chrome"]
 
     def remove(self):
@@ -129,13 +139,18 @@ class WindowsPlatform(Platform):
         # -- shlex would keep the quotes (posix=False) or mangle backslashes (posix=True).
         command_line = uninstall_string
         if uninstall_args:
-            command_line = f"{uninstall_string} {uninstall_args}"
+            command_line = f"{command_line} {uninstall_args}"
+        if self.UNINSTALL_FLAGS:
+            command_line = f"{command_line} {' '.join(self.UNINSTALL_FLAGS)}"
         print(f"running uninstall: {command_line}")
         result = subprocess.run(command_line, capture_output=True, text=True)
         sys.stdout.write(result.stdout or "")
-        if result.returncode != 0:
+        if result.returncode not in self.UNINSTALL_OK_CODES:
             sys.stderr.write(result.stderr or "")
             raise RuntimeError(f"uninstall failed (exit {result.returncode})")
+        if result.returncode != 0:
+            print(f"uninstall succeeded with exit {result.returncode} "
+                  f"(reboot may be needed to finish removing files)")
 
     def install(self, package_path):
         """Run the downloaded installer .exe silently, without launching the browser."""

@@ -53,7 +53,8 @@ import sys
 import time
 
 
-BROWSER_UPDATE_FLAG = "--update-silent --update-without-timeout"
+BROWSER_UPDATE_SILENT_FLAG = "--update-silent"
+BROWSER_UPDATE_WITHOUT_TIMEOUT_FLAG = "--update-without-timeout"
 BROWSER_SERVER_FLAG = "--update-server"   # passed as --update-server='<server>/<variant>'
 BROWSER_VERSION_FLAG = "--version"
 
@@ -75,7 +76,8 @@ def start_browser(browser_path, server_url, variant):
     update_server = f"{server_url.rstrip('/')}/{variant}"
     command = [
         browser_path,
-        BROWSER_UPDATE_FLAG,
+        BROWSER_UPDATE_SILENT_FLAG,
+        BROWSER_UPDATE_WITHOUT_TIMEOUT_FLAG,
         f"{BROWSER_SERVER_FLAG}={update_server}",
     ]
     print(f"launching: {' '.join(command)}", flush=True)

@@ -103,7 +103,7 @@ CONFIG = {
 # only (no signature), so it isn't listed.
 ARTIFACTS = {
     "newer": {
-        "windows": {
+        "exe": {
             "signature": "BC1DECA8C97114B1A8EC4A4E3C6F59CF290593F15D4D6EFC00F5ED83A57316A30B3AD96CE9FB50D0D1E80681A3922335DEE6B281B028E2533276DFAD2A649307",
             "timestamp": "05.08.2026",
         },

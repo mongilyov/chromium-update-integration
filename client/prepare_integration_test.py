@@ -2,11 +2,20 @@
 """
 prepare_integration_testing.py -- put the machine into a known baseline BEFORE the update
 test: remove the currently-installed browser, then install the "current" build fetched
-from the running test server's /download-current/<target>.
+from the running test server's /download-current/<os>/<installer>.
 
-Linux (apt/deb) is implemented. Windows and macOS raise NotImplementedError.
+Each OS's remove/install logic and constants live in its own Platform subclass
+(LinuxPlatform / WindowsPlatform / MacOSPlatform). prepare() selects the class once and
+drives it through the shared steps (privilege check -> remove -> download -> install).
 
-Assumes root/Administrator -- apt remove/install require it.
+Removal:  Linux (apt) and Windows (registry UninstallString + UninstallArguments, HKCU /
+          per-user only) are implemented. macOS and system-wide Windows raise
+          NotImplementedError.
+Install:  Linux (apt) and Windows (run the .exe with --silent --do-not-launch-chrome) are
+          implemented. macOS raises NotImplementedError.
+
+Assumes elevated privileges (Linux: root/sudo; Windows: Administrator as your install
+requires).
 
 USAGE
     python prepare_integration_testing.py --server http://HOST:PORT
@@ -28,83 +37,155 @@ import tempfile
 import urllib.request
 
 
-# Package to remove (and that the baseline install provides). Adjust to your package name.
-PACKAGE_NAME = "chromium-gost-stable"
+# ----------------------------------------------------------------------------------------
+# Per-OS logic + constants. Each subclass owns everything specific to its platform.
+# ----------------------------------------------------------------------------------------
 
-OS_BY_SYSTEM = {
-    "Linux": "linux",
-    "Windows": "windows",
-    "Darwin": "macos",
+class Platform:
+    """Base interface. OS_NAME / DEFAULT_INSTALLER feed the /download-current URL."""
+
+    OS_NAME = None
+    DEFAULT_INSTALLER = None
+
+    def require_privileges(self):
+        pass
+
+    def remove(self):
+        raise NotImplementedError(f"removal not implemented for {type(self).__name__}")
+
+    def install(self, package_path):
+        raise NotImplementedError(f"install not implemented for {type(self).__name__}")
+
+
+class LinuxPlatform(Platform):
+    OS_NAME = "linux"
+    DEFAULT_INSTALLER = "deb"
+    PACKAGE_NAME = "chromium-gost-stable"   # apt package to remove / that the .deb provides
+
+    def require_privileges(self):
+        if os.geteuid() != 0:
+            raise RuntimeError("must run as root (use sudo) -- apt remove/install need it")
+
+    def remove(self):
+        if not self._dpkg_installed(self.PACKAGE_NAME):
+            print(f"{self.PACKAGE_NAME} is not installed; nothing to remove")
+            return
+        print(f"removing {self.PACKAGE_NAME} via apt...")
+        result = subprocess.run(["apt", "remove", "-y", self.PACKAGE_NAME],
+                                capture_output=True, text=True)
+        sys.stdout.write(result.stdout)
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            raise RuntimeError(f"apt remove failed (exit {result.returncode})")
+
+    def install(self, package_path):
+        # apt treats an absolute path ending in .deb as a local package file and resolves
+        # dependencies.
+        print(f"installing {package_path} via apt...")
+        result = subprocess.run(["apt", "install", "-y", package_path],
+                                capture_output=True, text=True)
+        sys.stdout.write(result.stdout)
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            raise RuntimeError(f"apt install failed (exit {result.returncode})")
+
+    @staticmethod
+    def _dpkg_installed(package):
+        result = subprocess.run(["dpkg", "-s", package], capture_output=True, text=True)
+        return result.returncode == 0
+
+
+class WindowsPlatform(Platform):
+    OS_NAME = "windows"
+    DEFAULT_INSTALLER = "exe"
+
+    # Registry key (under HKCU for a per-user install) holding the uninstall command.
+    # You found `pv` under HKCU\Software\Chromium; confirm UninstallString/UninstallArguments
+    # live under this same key for your build, or repoint it.
+    UNINSTALL_KEY = r"Software\Chromium"
+    UNINSTALL_STRING_VALUE = "UninstallString"
+    UNINSTALL_ARGS_VALUE = "UninstallArguments"
+
+    INSTALL_FLAGS = ["--silent", "--do-not-launch-chrome"]
+
+    def remove(self):
+        """Read the uninstall command the browser registered under HKCU and run it verbatim
+        (UninstallString + UninstallArguments). System-wide (HKLM) is not implemented."""
+        import winreg
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.UNINSTALL_KEY) as key:
+                uninstall_string, _ = winreg.QueryValueEx(key, self.UNINSTALL_STRING_VALUE)
+                try:
+                    uninstall_args, _ = winreg.QueryValueEx(key, self.UNINSTALL_ARGS_VALUE)
+                except FileNotFoundError:
+                    uninstall_args = ""
+        except FileNotFoundError:
+            print(f"no uninstall entry at HKCU\\{self.UNINSTALL_KEY}; nothing to remove")
+            return
+
+        # UninstallString bundles the (quoted) exe path with its own args. Passing the whole
+        # command line as ONE string lets Windows' CreateProcess parse the quoting correctly
+        # -- shlex would keep the quotes (posix=False) or mangle backslashes (posix=True).
+        command_line = uninstall_string
+        if uninstall_args:
+            command_line = f"{uninstall_string} {uninstall_args}"
+        print(f"running uninstall: {command_line}")
+        result = subprocess.run(command_line, capture_output=True, text=True)
+        sys.stdout.write(result.stdout or "")
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr or "")
+            raise RuntimeError(f"uninstall failed (exit {result.returncode})")
+
+    def install(self, package_path):
+        """Run the downloaded installer .exe silently, without launching the browser."""
+        command = [package_path] + self.INSTALL_FLAGS
+        print(f"installing: {command}")
+        result = subprocess.run(command, capture_output=True, text=True)
+        sys.stdout.write(result.stdout or "")
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr or "")
+            raise RuntimeError(f"installer failed (exit {result.returncode})")
+
+
+class MacOSPlatform(Platform):
+    OS_NAME = "macos"
+    DEFAULT_INSTALLER = "tar"
+
+    def remove(self):
+        raise NotImplementedError("macOS removal not implemented yet")
+
+    def install(self, package_path):
+        raise NotImplementedError("macOS install not implemented yet")
+
+
+PLATFORMS = {
+    "Linux": LinuxPlatform,
+    "Windows": WindowsPlatform,
+    "Darwin": MacOSPlatform,
 }
-DEFAULT_INSTALLER_BY_SYSTEM = {
-    "Linux": "deb",
-    "Windows": "exe",
-    "Darwin": "tar",
-}
 
 
-def default_os():
-    return OS_BY_SYSTEM.get(platform.system())
+def current_platform():
+    system = platform.system()
+    platform_class = PLATFORMS.get(system)
+    if platform_class is None:
+        raise NotImplementedError(f"no platform support for '{system}'")
+    return platform_class()
 
 
-def default_installer():
-    return DEFAULT_INSTALLER_BY_SYSTEM.get(platform.system())
-
+# ----------------------------------------------------------------------------------------
+# Shared steps (platform-agnostic)
+# ----------------------------------------------------------------------------------------
 
 def normalize_server_url(server_url):
-    """Accept 'host:port' as well as 'http://host:port' -- urllib needs the scheme, so
-    default a missing one to http://."""
+    """Accept 'host:port' as well as 'http://host:port' -- urllib needs the scheme."""
     if not server_url:
         return server_url
     if "://" not in server_url:
         return "http://" + server_url
     return server_url
 
-
-def require_root():
-    """apt remove/install need root. Fail early and clearly if we're not root, rather
-    than deep inside an apt call. No-op on platforms without geteuid (e.g. Windows)."""
-    geteuid = getattr(os, "geteuid", None)
-    if geteuid is not None and geteuid() != 0:
-        raise RuntimeError("must run as root (use sudo) -- apt remove/install need it")
-
-
-# ----------------------------------------------------------------------------------------
-# Remove the currently-installed browser
-# ----------------------------------------------------------------------------------------
-
-def remove_current():
-    system = platform.system()
-    if system == "Linux":
-        return _remove_current_linux()
-    if system == "Windows":
-        raise NotImplementedError("Windows removal not implemented yet")
-    if system == "Darwin":
-        raise NotImplementedError("macOS removal not implemented yet")
-    raise NotImplementedError(f"no removal implemented for platform '{system}'")
-
-
-def _dpkg_installed(package):
-    result = subprocess.run(["dpkg", "-s", package], capture_output=True, text=True)
-    return result.returncode == 0
-
-
-def _remove_current_linux():
-    if not _dpkg_installed(PACKAGE_NAME):
-        print(f"{PACKAGE_NAME} is not installed; nothing to remove")
-        return
-    print(f"removing {PACKAGE_NAME} via apt...")
-    result = subprocess.run(["apt", "remove", "-y", PACKAGE_NAME],
-                            capture_output=True, text=True)
-    sys.stdout.write(result.stdout)
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr)
-        raise RuntimeError(f"apt remove failed (exit {result.returncode})")
-
-
-# ----------------------------------------------------------------------------------------
-# Fetch the baseline installer from the server
-# ----------------------------------------------------------------------------------------
 
 def _filename_from_disposition(disposition):
     match = re.search(r'filename="?([^"]+)"?', disposition or "")
@@ -117,7 +198,7 @@ def download_baseline(server_url, os_name, installer, dest_dir, timeout):
     with urllib.request.urlopen(url, timeout=timeout) as response:
         disposition = response.headers.get("Content-Disposition", "")
         data = response.read()
-    filename = _filename_from_disposition(disposition) or f"baseline-{target}"
+    filename = _filename_from_disposition(disposition) or f"baseline-{os_name}-{installer}"
     path = os.path.join(dest_dir, filename)
     with open(path, "wb") as handle:
         handle.write(data)
@@ -126,44 +207,26 @@ def download_baseline(server_url, os_name, installer, dest_dir, timeout):
 
 
 # ----------------------------------------------------------------------------------------
-# Install the baseline
-# ----------------------------------------------------------------------------------------
-
-def install(package_path):
-    system = platform.system()
-    if system == "Linux":
-        return _install_linux(package_path)
-    if system == "Windows":
-        raise NotImplementedError("Windows install not implemented yet")
-    if system == "Darwin":
-        raise NotImplementedError("macOS install not implemented yet")
-    raise NotImplementedError(f"no install implemented for platform '{system}'")
-
-
-def _install_linux(package_path):
-    # apt treats an argument containing a slash and ending in .deb as a local package file
-    # and resolves dependencies. package_path is absolute, so it qualifies.
-    print(f"installing {package_path} via apt...")
-    result = subprocess.run(["apt", "install", "-y", package_path],
-                            capture_output=True, text=True)
-    sys.stdout.write(result.stdout)
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr)
-        raise RuntimeError(f"apt install failed (exit {result.returncode})")
-
-
-# ----------------------------------------------------------------------------------------
 
 def prepare(server_url, os_name, installer, package, timeout):
-    remove_current()
+    target = current_platform()                       # pick the OS class once
+    target.require_privileges()
+
+    os_name = os_name or target.OS_NAME
+    installer = installer or target.DEFAULT_INSTALLER
+
+    target.remove()
+
     if package:
-        install(os.path.abspath(package))
+        target.install(os.path.abspath(package))
     else:
         if not server_url:
             raise ValueError("need --server (to fetch the baseline) or --package")
+        if os_name is None or installer is None:
+            raise ValueError("could not determine os/installer; pass --os and --installer")
         with tempfile.TemporaryDirectory(prefix="prepare-baseline-") as tmp:
             baseline = download_baseline(server_url, os_name, installer, tmp, timeout)
-            install(baseline)
+            target.install(baseline)
     print("baseline prepared")
 
 
@@ -182,15 +245,9 @@ def main(argv=None):
                         help="hard timeout for the baseline download")
     args = parser.parse_args(argv)
 
-    os_name = args.os_name or default_os()
-    installer = args.installer or default_installer()
-    if (os_name is None or installer is None) and not args.package:
-        print(f"could not determine os/installer for platform '{platform.system()}'; "
-              f"pass --os and --installer", file=sys.stderr)
-        return 2
-
+    server_url = normalize_server_url(args.server)
     try:
-        prepare(args.server, os_name, installer, args.package, args.timeout)
+        prepare(server_url, args.os_name, args.installer, args.package, args.timeout)
     except NotImplementedError as error:
         print(f"NOT IMPLEMENTED: {error}", file=sys.stderr)
         return 3

@@ -9,10 +9,11 @@ Each OS's remove/install logic and constants live in its own Platform subclass
 drives it through the shared steps (privilege check -> remove -> download -> install).
 
 Removal:  Linux (apt) and Windows (registry UninstallString + UninstallArguments, HKCU /
-          per-user only) are implemented. macOS and system-wide Windows raise
-          NotImplementedError.
-Install:  Linux (apt) and Windows (run the .exe with --silent --do-not-launch-chrome) are
-          implemented. macOS raises NotImplementedError.
+          per-user only) are implemented. macOS deletes /Applications/Chromium-Gost.app.
+          System-wide Windows raises NotImplementedError.
+Install:  Linux (apt), Windows (.exe with --silent --do-not-launch-chrome), and macOS
+          (extract .tar.bz2, ditto the .app into /Applications, then copy the bundle's
+          privileged helper over the blessed one in place) are implemented.
 
 Assumes elevated privileges (Linux: root/sudo; Windows: Administrator as your install
 requires).
@@ -37,10 +38,6 @@ import tempfile
 import urllib.request
 
 
-# ----------------------------------------------------------------------------------------
-# Per-OS logic + constants. Each subclass owns everything specific to its platform.
-# ----------------------------------------------------------------------------------------
-
 class Platform:
     """Base interface. OS_NAME / DEFAULT_INSTALLER feed the /download-current URL."""
 
@@ -60,7 +57,7 @@ class Platform:
 class LinuxPlatform(Platform):
     OS_NAME = "linux"
     DEFAULT_INSTALLER = "deb"
-    PACKAGE_NAME = "chromium-gost-stable"   # apt package to remove / that the .deb provides
+    PACKAGE_NAME = "chromium-gost-stable"
 
     def require_privileges(self):
         if os.geteuid() != 0:
@@ -79,8 +76,6 @@ class LinuxPlatform(Platform):
             raise RuntimeError(f"apt remove failed (exit {result.returncode})")
 
     def install(self, package_path):
-        # apt treats an absolute path ending in .deb as a local package file and resolves
-        # dependencies.
         print(f"installing {package_path} via apt...")
         result = subprocess.run(["apt", "install", "-y", package_path],
                                 capture_output=True, text=True)
@@ -99,21 +94,12 @@ class WindowsPlatform(Platform):
     OS_NAME = "windows"
     DEFAULT_INSTALLER = "exe"
 
-    # Registry key (under HKCU for a per-user install) holding the uninstall command.
-    # You found `pv` under HKCU\Software\Chromium; confirm UninstallString/UninstallArguments
-    # live under this same key for your build, or repoint it.
     UNINSTALL_KEY = r"Software\Chromium"
     UNINSTALL_STRING_VALUE = "UninstallString"
     UNINSTALL_ARGS_VALUE = "UninstallArguments"
 
-    # Appended after the registry's own args so the uninstall runs without the confirmation
-    # GUI. --force-uninstall suppresses the dialog; it does NOT wipe user data (that would
-    # be --delete-profile, deliberately left out).
     UNINSTALL_FLAGS = ["--force-uninstall"]
 
-    # Chromium/Omaha setup.exe exit codes that mean "it worked" (0) or "worked, but a
-    # reboot is needed to finish deleting some files" -- both are successful uninstalls,
-    # not failures. 19 = UNINSTALL_REQUIRES_REBOOT.
     UNINSTALL_OK_CODES = {0, 19}
 
     INSTALL_FLAGS = ["--silent", "--do-not-launch-chrome"]
@@ -134,9 +120,6 @@ class WindowsPlatform(Platform):
             print(f"no uninstall entry at HKCU\\{self.UNINSTALL_KEY}; nothing to remove")
             return
 
-        # UninstallString bundles the (quoted) exe path with its own args. Passing the whole
-        # command line as ONE string lets Windows' CreateProcess parse the quoting correctly
-        # -- shlex would keep the quotes (posix=False) or mangle backslashes (posix=True).
         command_line = uninstall_string
         if uninstall_args:
             command_line = f"{command_line} {uninstall_args}"
@@ -167,11 +150,46 @@ class MacOSPlatform(Platform):
     OS_NAME = "macos"
     DEFAULT_INSTALLER = "tar"
 
+    APP_NAME = "Chromium-Gost.app"
+    APP_PATH = "/Applications/Chromium-Gost.app"
+    HELPER_LABEL = "ru.company.browser-update-helper"
+    HELPER_BUNDLE_SUBDIR = "Contents/Library/LaunchServices"
+    PRIVILEGED_HELPER_DIR = "/Library/PrivilegedHelperTools"
+
+    def require_privileges(self):
+        if os.geteuid() != 0:
+            raise RuntimeError("must run as root (use sudo) -- "
+                               "modifying /Applications and /Library needs it")
+
     def remove(self):
-        raise NotImplementedError("macOS removal not implemented yet")
+        if os.path.exists(self.APP_PATH):
+            self._run(["rm", "-rf", self.APP_PATH], "remove app bundle")
+        else:
+            print(f"{self.APP_PATH} not present; nothing to remove")
 
     def install(self, package_path):
-        raise NotImplementedError("macOS install not implemented yet")
+        with tempfile.TemporaryDirectory(prefix="mac-bundle-") as tmp:
+            self._run(["tar", "-xjf", package_path, "-C", tmp], "extract tarball")
+            extracted_app = os.path.join(tmp, self.APP_NAME)
+            if not os.path.isdir(extracted_app):
+                raise RuntimeError(f"{self.APP_NAME} not found at top level of the tarball")
+            self._run(["ditto", extracted_app, self.APP_PATH], "install app bundle")
+
+            helper_src = os.path.join(self.APP_PATH, self.HELPER_BUNDLE_SUBDIR, self.HELPER_LABEL)
+            if not os.path.isfile(helper_src):
+                raise RuntimeError(f"helper not found in bundle: {helper_src}")
+            helper_dest = os.path.join(self.PRIVILEGED_HELPER_DIR, self.HELPER_LABEL)
+            os.makedirs(self.PRIVILEGED_HELPER_DIR, exist_ok=True)
+            self._run(["ditto", helper_src, helper_dest], "install privileged helper (in place)")
+
+    @staticmethod
+    def _run(command, what):
+        print(f"{what}: {' '.join(command)}")
+        result = subprocess.run(command, capture_output=True, text=True)
+        sys.stdout.write(result.stdout or "")
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr or "")
+            raise RuntimeError(f"{what} failed (exit {result.returncode})")
 
 
 PLATFORMS = {
@@ -188,10 +206,6 @@ def current_platform():
         raise NotImplementedError(f"no platform support for '{system}'")
     return platform_class()
 
-
-# ----------------------------------------------------------------------------------------
-# Shared steps (platform-agnostic)
-# ----------------------------------------------------------------------------------------
 
 def normalize_server_url(server_url):
     """Accept 'host:port' as well as 'http://host:port' -- urllib needs the scheme."""
@@ -221,10 +235,8 @@ def download_baseline(server_url, os_name, installer, dest_dir, timeout):
     return path
 
 
-# ----------------------------------------------------------------------------------------
-
 def prepare(server_url, os_name, installer, package, timeout):
-    target = current_platform()                       # pick the OS class once
+    target = current_platform()
     target.require_privileges()
 
     os_name = os_name or target.OS_NAME

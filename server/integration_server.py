@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_update_server.py -- test update server for a Chromium-Gost auto-updater. Standard
+integration_server.py -- test update server for a Chromium-Gost auto-updater. Standard
 library only. Serves pre-signed artifacts you drop on disk; signs nothing. The self-test
 lives in selftest.py.
 
@@ -31,6 +31,9 @@ ENDPOINTS
     /download-current/<os>/<installer>                           raw current installer
                                                                  (baseline for integration
                                                                  tests)
+    PUT /upload-current/<os>/<installer>                         store a current installer
+                                                                 (body = bytes; filename
+                                                                 from current/version.txt)
 
 VARIANTS (check flow)
     ok         newer version, valid            -> expect install
@@ -87,7 +90,6 @@ INSTALLER_EXT = {
     "tar": ".tar.bz2",
 }
 
-# The (os, installer) pairs that actually exist, for preflight/reporting and demos.
 TARGETS = (("windows", "exe"), ("linux", "deb"), ("linux", "rpm"), ("macos", "tar"))
 
 ALL_ROLES = ("current", "newer", "older")
@@ -98,9 +100,6 @@ CONFIG = {
     "hang_seconds": 3600,
 }
 
-# Signature + timestamp per check role, keyed by installer. Versions and paths are NOT
-# here -- versions come from version.txt, filenames are derived. `current` is download-
-# only (no signature), so it isn't listed.
 ARTIFACTS = {
     "newer": {
         "exe": {
@@ -257,6 +256,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._route()
 
+    def do_PUT(self):
+        self._route()
+
     def _request_base_url(self):
         host_header = self.headers.get("Host")
         scheme = getattr(self.server, "scheme", "http")
@@ -274,6 +276,11 @@ class _Handler(BaseHTTPRequestHandler):
             if len(parts) < 3:
                 return self._plain(404, "expected /download-current/<os>/<installer>")
             return self._serve_current(parts[1], parts[2])
+
+        if parts[0] == "upload-current":
+            if len(parts) < 3:
+                return self._plain(404, "expected PUT /upload-current/<os>/<installer>")
+            return self._serve_upload(parts[1], parts[2])
 
         variant_name = parts[0]
         variant = VARIANTS.get(variant_name)
@@ -341,6 +348,47 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve_bytes(self, data, filename):
         self._send(200, "application/octet-stream", data,
                    extra_headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    def _serve_upload(self, os_name, installer):
+        """Store an uploaded 'current' artifact. The filename is derived from
+        current/version.txt (assumed correct on the server) + os + installer, so the
+        request body only carries bytes -- nothing from the URL becomes a path."""
+        if os_name not in OS_VALUES:
+            return self._plain(400, f"invalid os '{os_name}'; expected one of {OS_VALUES}")
+        if installer not in INSTALLER_VALUES:
+            return self._plain(400, f"invalid installer '{installer}'; expected one of {INSTALLER_VALUES}")
+        try:
+            version = role_version("current")
+            filename = payload_filename(version, os_name, installer)
+        except ConfigError as error:
+            self._log_resolution("upload-current", {"os": os_name, "installer": installer}, error)
+            return self._plain(500, f"config not ready: {error}")
+
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return self._plain(400, "empty upload (need Content-Length and a body)")
+
+        dest_dir = os.path.join(CONFIG["artifacts_dir"], "current")
+        os.makedirs(dest_dir, exist_ok=True)
+        final_path = os.path.join(dest_dir, filename)
+        part_path = final_path + ".part"
+
+        remaining = length
+        with open(part_path, "wb") as handle:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                handle.write(chunk)
+                remaining -= len(chunk)
+        if remaining != 0:
+            os.remove(part_path)
+            return self._plain(400, f"upload truncated ({length - remaining}/{length} bytes)")
+        os.replace(part_path, final_path)   # only appears complete, never half-written
+
+        self._log_resolution("upload-current", {"os": os_name, "installer": installer},
+                             f"stored {filename} ({length}B)")
+        self._plain(200, f"stored {filename} ({length}B)\n")
 
     def _log_resolution(self, name, telemetry, outcome):
         sys.stderr.write(f"[server] {name} request={telemetry!r} -> {outcome!r}\n")
@@ -512,7 +560,7 @@ def main(argv=None):
     base_url = server.start()
     print(base_url, flush=True)
     print("variants: " + ", ".join(sorted(VARIANTS)), flush=True)
-    print("plus: /download-current/<os>/<installer>", flush=True)
+    print("plus: /download-current/<os>/<installer>  and  PUT /upload-current/<os>/<installer>", flush=True)
     print_artifact_report()
     print("Ctrl-C to stop.", flush=True)
     try:

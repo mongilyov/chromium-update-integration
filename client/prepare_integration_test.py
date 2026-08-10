@@ -11,7 +11,7 @@ Usage:
     python prepare_integration_testing.py [--server <url>]
         [--os linux] [--installer deb] [--package <path>] [--timeout 120]
 
-URL can be passed as an environment variable CHROMIUM_TEST_UPDATE_SERVER_URL
+URL can be passed as an environment variable.
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+
+
+SERVER_ENV_VARIABLE='CHROMIUM_TEST_UPDATE_SERVER_URL'
 
 
 class Platform:
@@ -243,8 +246,9 @@ def prepare(server_url, os_name, installer, package, timeout):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Remove the current browser and install the baseline for testing.")
-    parser.add_argument("--server", default=None,
-                        help="base URL of the running update server (for /download-current)")
+    parser.add_argument("--server", default=os.environ.get(SERVER_ENV_VARIABLE),
+                        help="base URL of the running update server (for /download-current). "
+                        f"Can also be set via {SERVER_ENV_VARIABLE} envrionment variable")
     parser.add_argument("--os", dest="os_name", default=None,
                         help="download-current os; defaults to this platform's")
     parser.add_argument("--installer", default=None,
@@ -256,8 +260,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     server_url = normalize_server_url(args.server)
-    if not server_url:
-        server_url = os.environ.get('CHROMIUM_TEST_UPDATE_SERVER_URL')
     try:
         prepare(server_url, args.os_name, args.installer, args.package, args.timeout)
     except NotImplementedError as error:

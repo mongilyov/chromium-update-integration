@@ -13,7 +13,7 @@ Usage:
         [--expect-version 999.0.0.0] [--timeout 120] [--poll-interval 1.0]
         [--relaunch-grace 5.0]
 
-URL can be passed as an environment variable CHROMIUM_TEST_UPDATE_SERVER_URL
+URL can be passed as an environment variable.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ import subprocess
 import sys
 import time
 
+
+SERVER_ENV_VARIABLE='CHROMIUM_TEST_UPDATE_SERVER_URL'
 
 BROWSER_UPDATE_FLAGS = ["--update-silent", "--update-without-timeout"]
 BROWSER_SERVER_FLAG = "--update-server"
@@ -294,7 +296,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Drive the browser through one update scenario.")
     parser.add_argument("--browser", required=True, help="path to the browser executable")
     parser.add_argument("--variant", default="ok", help="server variant/role (ok, downgrade, ...)")
-    parser.add_argument("--server", help="base URL of a running update server")
+    parser.add_argument("--server", default=os.environ.get(SERVER_ENV_VARIABLE),
+                        help="base URL of the running update server. "
+                        f"Can also be set via {SERVER_ENV_VARIABLE} envrionment variable")
     parser.add_argument("--expect-version", default=None,
                         help="if given, wait for exactly this version; else wait for any change")
     parser.add_argument("--timeout", type=float, default=120.0,
@@ -305,11 +309,9 @@ def main(argv=None):
                         help="seconds to wait for relaunch before closing the test browser")
     args = parser.parse_args(argv)
 
-    if not server_url:
-        server_url = os.environ.get('CHROMIUM_TEST_UPDATE_SERVER_URL')
-        if not server_url:
-            print(f"Server URL is required either as a CLI switch or as an env variable CHROMIUM_TEST_UPDATE_SERVER_URL")
-            return 1
+    if not args.server:
+        print(f"Server URL is required either as a CLI switch or as an env variable CHROMIUM_TEST_UPDATE_SERVER_URL")
+        return 1
     try:
         return run_case(args.browser, args.server, args.variant,
                         args.expect_version, args.timeout, args.poll_interval,

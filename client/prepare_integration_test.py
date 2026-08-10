@@ -8,8 +8,10 @@ installed browser, then install the "current" build fetched from the server's
 its own Platform subclass; prepare() picks one and drives it through the shared steps.
 
 Usage:
-    python prepare_integration_testing.py --server <url>
+    python prepare_integration_testing.py [--server <url>]
         [--os linux] [--installer deb] [--package <path>] [--timeout 120]
+
+URL can be passed as an environment variable CHROMIUM_TEST_UPDATE_SERVER_URL
 """
 
 from __future__ import annotations
@@ -229,7 +231,7 @@ def prepare(server_url, os_name, installer, package, timeout):
         target.install(os.path.abspath(package))
     else:
         if not server_url:
-            raise ValueError("need --server (to fetch the baseline) or --package")
+            raise ValueError("need --server (to fetch the baseline), env variable CHROMIUM_TEST_UPDATE_SERVER_URL or --package")
         if os_name is None or installer is None:
             raise ValueError("could not determine os/installer; pass --os and --installer")
         with tempfile.TemporaryDirectory(prefix="prepare-baseline-") as tmp:
@@ -254,6 +256,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     server_url = normalize_server_url(args.server)
+    if not server_url:
+        server_url = os.environ.get('CHROMIUM_TEST_UPDATE_SERVER_URL')
     try:
         prepare(server_url, args.os_name, args.installer, args.package, args.timeout)
     except NotImplementedError as error:

@@ -9,9 +9,11 @@ Per-OS logic (version read, process lookup, kill, post-relaunch check) lives in 
 subclasses; run_case() picks one.
 
 Usage:
-    python run_integration_testing.py --browser <path> --server <url> --variant ok
+    python run_integration_testing.py --browser <path> --variant ok [--server <url>]
         [--expect-version 999.0.0.0] [--timeout 120] [--poll-interval 1.0]
         [--relaunch-grace 5.0]
+
+URL can be passed as an environment variable CHROMIUM_TEST_UPDATE_SERVER_URL
 """
 
 from __future__ import annotations
@@ -291,8 +293,8 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Drive the browser through one update scenario.")
     parser.add_argument("--browser", required=True, help="path to the browser executable")
-    parser.add_argument("--server", required=True, help="base URL of a running update server")
     parser.add_argument("--variant", default="ok", help="server variant/role (ok, downgrade, ...)")
+    parser.add_argument("--server", help="base URL of a running update server")
     parser.add_argument("--expect-version", default=None,
                         help="if given, wait for exactly this version; else wait for any change")
     parser.add_argument("--timeout", type=float, default=120.0,
@@ -303,6 +305,11 @@ def main(argv=None):
                         help="seconds to wait for relaunch before closing the test browser")
     args = parser.parse_args(argv)
 
+    if not server_url:
+        server_url = os.environ.get('CHROMIUM_TEST_UPDATE_SERVER_URL')
+        if not server_url:
+            print(f"Server URL is required either as a CLI switch or as an env variable CHROMIUM_TEST_UPDATE_SERVER_URL")
+            return 1
     try:
         return run_case(args.browser, args.server, args.variant,
                         args.expect_version, args.timeout, args.poll_interval,

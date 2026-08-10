@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-test_update_server.py
+integration_server.py
 
-Test update server for a Chromium-Gost auto-updater (stdlib only). Serves pre-signed
-artifacts you drop on disk under artifacts/<role>/ -- version from version.txt, filenames
-derived by convention. Signs nothing; self-test lives in selftest.py.
+Server for integration tests of a Chromium-Gost auto-updater. Serves pre-signed
+artifacts dropped on disk under artifacts/<role>/ -- version from version.txt, filenames
+derived by convention.
 
 Endpoints:
     /<variant>/update
@@ -12,10 +12,8 @@ Endpoints:
     /download-current/<os>/<installer>
     PUT /upload-current/<os>/<installer>
 
-Fill ARTIFACTS below with your real signatures (keyed by installer).
-
 Usage:
-    python test_update_server.py [--host H] [--port P] [--artifacts DIR] [--quiet]
+    python integration_server.py [--host H] [--port P] [--artifacts DIR] [--quiet]
 """
 
 

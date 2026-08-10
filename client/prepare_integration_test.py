@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
 """
-prepare_integration_testing.py -- put the machine into a known baseline BEFORE the update
-test: remove the currently-installed browser, then install the "current" build fetched
-from the running test server's /download-current/<os>/<installer>.
+prepare_integration_testing.py
 
-Each OS's remove/install logic and constants live in its own Platform subclass
-(LinuxPlatform / WindowsPlatform / MacOSPlatform). prepare() selects the class once and
-drives it through the shared steps (privilege check -> remove -> download -> install).
+Put the machine into a known baseline before the update test: remove the currently
+installed browser, then install the "current" build fetched from the server's
+/download-current/<os>/<installer>. Each OS's remove/install logic and constants live in
+its own Platform subclass; prepare() picks one and drives it through the shared steps.
 
-Removal:  Linux (apt) and Windows (registry UninstallString + UninstallArguments, HKCU /
-          per-user only) are implemented. macOS deletes /Applications/Chromium-Gost.app.
-          System-wide Windows raises NotImplementedError.
-Install:  Linux (apt), Windows (.exe with --silent --do-not-launch-chrome), and macOS
-          (extract .tar.bz2, ditto the .app into /Applications, then copy the bundle's
-          privileged helper over the blessed one in place) are implemented.
-
-Assumes elevated privileges (Linux: root/sudo; Windows: Administrator as your install
-requires).
-
-USAGE
-    python prepare_integration_testing.py --server http://HOST:PORT
-        [--os linux] [--installer deb] [--package /path/to/local.deb]
-
-    --os/--installer  default to this platform (Linux -> linux/deb).
-    --package  install this local file instead of fetching /download-current.
+Usage:
+    python prepare_integration_testing.py --server <url>
+        [--os linux] [--installer deb] [--package <path>] [--timeout 120]
 """
 
 from __future__ import annotations
@@ -39,7 +25,6 @@ import urllib.request
 
 
 class Platform:
-    """Base interface. OS_NAME / DEFAULT_INSTALLER feed the /download-current URL."""
 
     OS_NAME = None
     DEFAULT_INSTALLER = None
@@ -100,13 +85,11 @@ class WindowsPlatform(Platform):
 
     UNINSTALL_FLAGS = ["--force-uninstall"]
 
-    UNINSTALL_OK_CODES = {0, 19}
+    UNINSTALL_OK_CODES = {0, 19}  # 19 = reboot-required, still a successful uninstall
 
     INSTALL_FLAGS = ["--silent", "--do-not-launch-chrome"]
 
     def remove(self):
-        """Read the uninstall command the browser registered under HKCU and run it verbatim
-        (UninstallString + UninstallArguments). System-wide (HKLM) is not implemented."""
         import winreg
 
         try:
@@ -136,7 +119,6 @@ class WindowsPlatform(Platform):
                   f"(reboot may be needed to finish removing files)")
 
     def install(self, package_path):
-        """Run the downloaded installer .exe silently, without launching the browser."""
         command = [package_path] + self.INSTALL_FLAGS
         print(f"installing: {command}")
         result = subprocess.run(command, capture_output=True, text=True)
@@ -152,7 +134,7 @@ class MacOSPlatform(Platform):
 
     APP_NAME = "Chromium-Gost.app"
     APP_PATH = "/Applications/Chromium-Gost.app"
-    HELPER_LABEL = "ru.company.browser-update-helper"
+    HELPER_LABEL = "ru.cryptopro.browser-update-helper"
     HELPER_BUNDLE_SUBDIR = "Contents/Library/LaunchServices"
     PRIVILEGED_HELPER_DIR = "/Library/PrivilegedHelperTools"
 
@@ -208,7 +190,6 @@ def current_platform():
 
 
 def normalize_server_url(server_url):
-    """Accept 'host:port' as well as 'http://host:port' -- urllib needs the scheme."""
     if not server_url:
         return server_url
     if "://" not in server_url:

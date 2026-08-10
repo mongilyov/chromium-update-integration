@@ -1,56 +1,23 @@
 #!/usr/bin/env python3
 """
-integration_server.py -- test update server for a Chromium-Gost auto-updater. Standard
-library only. Serves pre-signed artifacts you drop on disk; signs nothing. The self-test
-lives in selftest.py.
+test_update_server.py
 
-DISK LAYOUT (flat -- no per-target subfolders, no paths hard-coded here except signatures)
-    artifacts/
-      <role>/
-        version.txt                 the role's version, e.g. 150.0.7871.212
-        <filename>                  the installers, named by convention, sitting flat
+Test update server for a Chromium-Gost auto-updater (stdlib only). Serves pre-signed
+artifacts you drop on disk under artifacts/<role>/ -- version from version.txt, filenames
+derived by convention. Signs nothing; self-test lives in selftest.py.
 
-    role      : current | newer | older
-    os        : windows | linux | macos
-    installer : deb | rpm (linux) | exe (windows) | tar (macos)
-    filename  : chromium-gost-<version>-<os-arch><ext>
-                  os-arch: windows-amd64 | linux-amd64 | macos-arm64
-                  ext    : .deb | .rpm | -installer.exe | .tar.bz2
-                e.g. chromium-gost-999.0.0.0-linux-amd64.deb
-    Per release: edit version.txt, drop the (conventionally named) files into
-    artifacts/<role>/, and -- for the check roles only -- paste the signature into
-    ARTIFACTS below (keyed by installer). Never a path here.
+Endpoints:
+    /<variant>/update
+    /<variant>/download-update/<role>/<os>/<installer>/<file>
+    /download-current/<os>/<installer>
+    PUT /upload-current/<os>/<installer>
 
-REQUEST (telemetry)
-    Browser sends os + installer + version. os must be one of the three, installer one of
-    the four; version must be dotted. Anything else is a 400.
+Fill ARTIFACTS below with your real signatures (keyed by installer).
 
-ENDPOINTS
-    /<variant>/update                                            check
-    /<variant>/download-update/<role>/<os>/<installer>/<file>    payload for the check flow
-    /download-current/<os>/<installer>                           raw current installer
-                                                                 (baseline for integration
-                                                                 tests)
-    PUT /upload-current/<os>/<installer>                         store a current installer
-                                                                 (body = bytes; filename
-                                                                 from current/version.txt)
-
-VARIANTS (check flow)
-    ok         newer version, valid            -> expect install
-    downgrade  older version, valid (forced)   -> browser must reject
-    corrupt    newer, one payload byte flipped -> signature check fails
-    truncated / badjson / http500 / hang       misbehaving responses
-
-    update_available is computed (offered > reported) except downgrade, which forces the
-    offer. VERSION comes from version.txt; SIGNATURE + TIMESTAMP per check role/installer
-    live in ARTIFACTS below (can't be derived).
-
-QUICK START
-    python test_update_server.py                  # prints banner + preflight, serves
-    python selftest.py --demo                      # exercise every variant with fakes
+Usage:
+    python test_update_server.py [--host H] [--port P] [--artifacts DIR] [--quiet]
 """
 
-# TODO: fill in ARTIFACTS signatures with your real signed files
 
 from __future__ import annotations
 
@@ -133,7 +100,7 @@ VARIANTS = {
 
 
 class ConfigError(Exception):
-    """Raised when a request needs artifact data that disk/ARTIFACTS doesn't provide."""
+    pass
 
 
 def _version_key(version):
@@ -141,7 +108,6 @@ def _version_key(version):
 
 
 def payload_filename(version, os_name, installer):
-    """chromium-gost-<version>-<os-arch><ext>."""
     if os_name not in OS_ARCH:
         raise ConfigError(f"unknown os '{os_name}'; expected one of {OS_VALUES}")
     if installer not in INSTALLER_EXT:
@@ -150,7 +116,6 @@ def payload_filename(version, os_name, installer):
 
 
 def role_version(role):
-    """The role's version, read from artifacts/<role>/version.txt."""
     path = os.path.join(CONFIG["artifacts_dir"], role, VERSION_FILE)
     if not os.path.isfile(path):
         raise ConfigError(f"missing version file: {path}")
@@ -162,7 +127,6 @@ def role_version(role):
 
 
 def payload_path(role, os_name, installer):
-    """Absolute path to the installer (flat under the role dir), plus its filename."""
     version = role_version(role)
     filename = payload_filename(version, os_name, installer)
     path = os.path.join(CONFIG["artifacts_dir"], role, filename)
@@ -182,7 +146,6 @@ def signature_meta(role, installer):
 
 
 def build_response(variant_name, variant, os_name, installer, client_version, base_url):
-    """Return the response document for a check. Edit THIS to match your real schema."""
     role = variant["role"]
     offered_version = role_version(role)
     available = (variant.get("force_available")
@@ -210,7 +173,6 @@ def _corrupt(data):
 
 
 def artifact_report():
-    """(role, os, installer, path, exists) for every role/target; version None missing."""
     rows = []
     for role in ALL_ROLES:
         try:
@@ -350,9 +312,6 @@ class _Handler(BaseHTTPRequestHandler):
                    extra_headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     def _serve_upload(self, os_name, installer):
-        """Store an uploaded 'current' artifact. The filename is derived from
-        current/version.txt (assumed correct on the server) + os + installer, so the
-        request body only carries bytes -- nothing from the URL becomes a path."""
         if os_name not in OS_VALUES:
             return self._plain(400, f"invalid os '{os_name}'; expected one of {OS_VALUES}")
         if installer not in INSTALLER_VALUES:
@@ -486,12 +445,6 @@ def maybe_wrap_tls(sock, certfile, keyfile):
 
 
 class UpdateServer:
-    """Loopback, ephemeral-port test update server.
-
-        server = UpdateServer()
-        base_url = server.start()
-        server.stop()
-    """
 
     def __init__(self, host="127.0.0.1", port=0, quiet=False,
                  tls_cert=None, tls_key=None):

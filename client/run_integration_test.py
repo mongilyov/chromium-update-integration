@@ -1,33 +1,15 @@
-#!/usr/bin/env python3
 """
-run_integration_testing.py -- drive the browser-under-test through one update scenario and
-report/assert the outcome. Does NOT run the update server; point --server at an already-
-running one (see test_update_server.py).
+run_integration_testing.py
 
-WHAT IT DOES
-    Launches, once, identically on every platform:
-        <browser> --update-silent --update-without-timeout --update-server='<server>/<variant>'
-    The browser downloads, verifies, installs (dpkg on Linux, installer on Windows, folder
-    swap on macOS -- all BEFORE relaunch), then relaunches into a live window.
+Drive the browser through one update scenario and assert the result: launch it to update,
+poll the installed version until it changes, let it relaunch, then close only the browser
+processes running from the browser's own executable path. Does not run the update server.
 
-    The install takes real time, so the test polls the installed version until it changes
-    (bounded by --timeout) rather than sleeping a fixed amount.
+Per-OS logic (version read, process lookup, kill, post-relaunch check) lives in Platform
+subclasses; run_case() picks one.
 
-PER-OS LOGIC LIVES IN Platform SUBCLASSES
-    LinuxPlatform / WindowsPlatform / MacOSPlatform each own how to read the installed
-    version, enumerate processes by executable path, kill them, and run the post-relaunch
-    check -- plus their own constants. run_case() selects the class once.
-
-    Version read:  Linux/macOS -> <browser> --version ; Windows -> registry "pv".
-    Teardown:      close every process whose EXECUTABLE PATH is the browser we launched.
-                   Your everyday browser lives elsewhere, so it's never touched; the
-                   relaunched build runs the freshly installed binary at the same path.
-
-USAGE
-    python run_integration_testing.py \
-        --browser /path/to/chrome \
-        --server http://192.168.44.10:8080 \
-        --variant ok \
+Usage:
+    python run_integration_testing.py --browser <path> --server <url> --variant ok
         [--expect-version 999.0.0.0] [--timeout 120] [--poll-interval 1.0]
         [--relaunch-grace 5.0]
 """
@@ -45,60 +27,39 @@ import time
 
 
 BROWSER_UPDATE_FLAGS = ["--update-silent", "--update-without-timeout"]
-BROWSER_SERVER_FLAG = "--update-server"   # passed as --update-server='<server>/<variant>'
+BROWSER_SERVER_FLAG = "--update-server"
 BROWSER_VERSION_FLAG = "--version"
 
 RELAUNCH_GRACE_SECONDS = 5.0
 
 
-# ----------------------------------------------------------------------------------------
-# Shared helpers (platform-agnostic)
-# ----------------------------------------------------------------------------------------
-
 def parse_version_output(output):
-    """Pull a dotted version out of `<browser> --version` output, e.g.
-    'Chromium 999.0.0.0' -> '999.0.0.0'. Adjust if your build prints differently."""
     match = re.search(r"\d+(?:\.\d+)+", output)
     return match.group(0) if match else None
 
 
 def _norm_path(path):
     path = path.strip()
-    if path.endswith(" (deleted)"):        # Linux: shown once the binary is swapped in place
+    if path.endswith(" (deleted)"):
         path = path[: -len(" (deleted)")]
     return os.path.normcase(os.path.realpath(path))
 
 
 def start_browser(browser_path, server_url, variant):
-    """Launch the browser once (plain subprocess -- no process group; the relaunch escapes
-    it anyway). Identical on every platform."""
     update_server = f"{server_url.rstrip('/')}/{variant}"
-    command = [
-        browser_path,
-        *BROWSER_UPDATE_FLAGS,
-        f"{BROWSER_SERVER_FLAG}={update_server}",
-    ]
+    command = [browser_path, *BROWSER_UPDATE_FLAGS, f"{BROWSER_SERVER_FLAG}={update_server}"]
     print(f"launching: {' '.join(command)}", flush=True)
     return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-# ----------------------------------------------------------------------------------------
-# Per-OS logic + constants. Each subclass owns everything specific to its platform.
-# ----------------------------------------------------------------------------------------
-
 class Platform:
-    """Base: version via `<browser> --version`, POSIX signal-based kill, no post-relaunch
-    check. Windows overrides the version read and the kill; each OS supplies process
-    lookup."""
-
     def installed_version(self, browser_path):
         completed = subprocess.run([browser_path, BROWSER_VERSION_FLAG],
                                    capture_output=True, text=True)
         if completed.returncode != 0:
             raise RuntimeError(
                 f"'{browser_path} {BROWSER_VERSION_FLAG}' failed: "
-                f"{completed.stderr.strip() or completed.stdout.strip()}"
-            )
+                f"{completed.stderr.strip() or completed.stdout.strip()}")
         output = (completed.stdout + completed.stderr).strip()
         version = parse_version_output(output)
         if version is None:
@@ -106,7 +67,6 @@ class Platform:
         return version
 
     def read_version(self, browser_path):
-        """installed_version() but None instead of raising, for polling."""
         try:
             return self.installed_version(browser_path)
         except RuntimeError:
@@ -116,7 +76,6 @@ class Platform:
         raise NotImplementedError(f"process lookup not implemented for {type(self).__name__}")
 
     def close_pids(self, pids):
-        """POSIX: SIGTERM, then SIGKILL any survivors. Windows overrides."""
         if not pids:
             return
         for pid in pids:
@@ -167,20 +126,14 @@ class MacOSPlatform(Platform):
         return pids
 
     def post_relaunch_check(self, browser_path):
-        # TODO: verify cleanup after relaunch (old version folder removed, new bundle in
-        # place, staging/temp dirs gone). Return failure strings, or [] when clean.
         return []
 
 
 class WindowsPlatform(Platform):
-    # Registry location of the installed version (Omaha "pv"). Repoint to your fork's
-    # branded key if needed; HKLM is tried as a fallback.
     PV_KEY = r"Software\Chromium"
     PV_VALUE = "pv"
 
     def installed_version(self, browser_path):
-        """--version is a no-op on Windows, so read Omaha's "pv". browser_path is unused.
-        Tries HKCU (per-user install) then HKLM (system-wide)."""
         import winreg
 
         hives = [
@@ -198,8 +151,6 @@ class WindowsPlatform(Platform):
         raise RuntimeError("registry version not found; tried: " + ", ".join(tried))
 
     def pids_for_executable(self, exe_path):
-        """Enumerate processes via the Win32 API (psapi/kernel32) and return those whose
-        full image path matches. Pure ctypes -- no subprocess, no PowerShell quoting."""
         import ctypes
         from ctypes import wintypes
 
@@ -271,12 +222,7 @@ def current_platform():
     return platform_class()
 
 
-# ----------------------------------------------------------------------------------------
-# Teardown + polling (generic, driven by the chosen platform)
-# ----------------------------------------------------------------------------------------
-
 def close_browser_at_path(target, browser_path, launched_process):
-    """Close every process running the browser at browser_path. Best-effort."""
     try:
         pids = target.pids_for_executable(browser_path)
     except Exception:
@@ -291,8 +237,6 @@ def close_browser_at_path(target, browser_path, launched_process):
 
 
 def wait_for_update(target, browser_path, start_version, expect_version, timeout, poll_interval):
-    """Poll until the version changes off start_version (or equals expect_version, if
-    given), or timeout. Returns (changed, last_seen). Never blocks past `timeout`."""
     deadline = time.monotonic() + timeout
     last_seen = start_version
     while time.monotonic() < deadline:
@@ -308,13 +252,9 @@ def wait_for_update(target, browser_path, start_version, expect_version, timeout
     return False, last_seen
 
 
-# ----------------------------------------------------------------------------------------
-# One test case
-# ----------------------------------------------------------------------------------------
-
 def run_case(browser_path, server_url, variant, expect_version, timeout, poll_interval,
              relaunch_grace):
-    target = current_platform()                        # pick the OS class once
+    target = current_platform()
 
     start_version = target.read_version(browser_path)
     print(f"version before update: {start_version}")

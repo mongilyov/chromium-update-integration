@@ -9,8 +9,8 @@ derived by convention.
 Endpoints:
     /<variant>/update
     /<variant>/download-update/<role>/<os>/<installer>/<file>
-    /download-current/<os>/<installer>
-    PUT /upload-current/<os>/<installer>
+    /download-<current|newer|older>/<os>/<installer>
+    PUT /upload-<current|newer|older>/<os>/<installer>
 
 Usage:
     python integration_server.py [--host H] [--port P] [--artifacts DIR] [--quiet]
@@ -230,17 +230,19 @@ class _Handler(BaseHTTPRequestHandler):
         if not parts or not parts[0]:
             return self._plain(404, "expected /<variant>/update, "
                                     "/<variant>/download-update/<role>/<os>/<installer>/<file>, "
-                                    "or /download-current/<os>/<installer>")
+                                    "or /download-<current|newer|older>/<os>/<installer>")
 
-        if parts[0] == "download-current":
+        if parts[0] in ("download-current", "download-newer", "download-older"):
             if len(parts) < 3:
-                return self._plain(404, "expected /download-current/<os>/<installer>")
-            return self._serve_current(parts[1], parts[2])
+                return self._plain(404, f"expected /{parts[0]}/<os>/<installer>")
+            role = parts[0][len("download-"):]
+            return self._serve_role(role, parts[1], parts[2])
 
-        if parts[0] == "upload-current":
+        if parts[0] in ("upload-current", "upload-newer", "upload-older"):
             if len(parts) < 3:
-                return self._plain(404, "expected PUT /upload-current/<os>/<installer>")
-            return self._serve_upload(parts[1], parts[2])
+                return self._plain(404, f"expected PUT /{parts[0]}/<os>/<installer>")
+            role = parts[0][len("upload-"):]
+            return self._serve_upload(role, parts[1], parts[2])
 
         variant_name = parts[0]
         variant = VARIANTS.get(variant_name)
@@ -292,16 +294,16 @@ class _Handler(BaseHTTPRequestHandler):
                              f"served {filename} ({len(data)}B)")
         self._serve_bytes(data, filename)
 
-    def _serve_current(self, os_name, installer):
+    def _serve_role(self, role, os_name, installer):
         try:
-            path, filename = payload_path("current", os_name, installer)
+            path, filename = payload_path(role, os_name, installer)
         except ConfigError as error:
-            self._log_resolution("download-current", {"os": os_name, "installer": installer}, error)
+            self._log_resolution(f"download-{role}", {"os": os_name, "installer": installer}, error)
             status = 400 if "unknown" in str(error) else 500
             return self._plain(status, str(error))
         with open(path, "rb") as handle:
             data = handle.read()
-        self._log_resolution("download-current", {"os": os_name, "installer": installer},
+        self._log_resolution(f"download-{role}", {"os": os_name, "installer": installer},
                              f"served {filename} ({len(data)}B)")
         self._serve_bytes(data, filename)
 
@@ -309,23 +311,25 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, "application/octet-stream", data,
                    extra_headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-    def _serve_upload(self, os_name, installer):
+    def _serve_upload(self, role, os_name, installer):
+        if role not in ALL_ROLES:
+            return self._plain(400, f"invalid role '{role}'; expected one of {ALL_ROLES}")
         if os_name not in OS_VALUES:
             return self._plain(400, f"invalid os '{os_name}'; expected one of {OS_VALUES}")
         if installer not in INSTALLER_VALUES:
             return self._plain(400, f"invalid installer '{installer}'; expected one of {INSTALLER_VALUES}")
         try:
-            version = role_version("current")
+            version = role_version(role)
             filename = payload_filename(version, os_name, installer)
         except ConfigError as error:
-            self._log_resolution("upload-current", {"os": os_name, "installer": installer}, error)
+            self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer}, error)
             return self._plain(500, f"config not ready: {error}")
 
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length <= 0:
             return self._plain(400, "empty upload (need Content-Length and a body)")
 
-        dest_dir = os.path.join(CONFIG["artifacts_dir"], "current")
+        dest_dir = os.path.join(CONFIG["artifacts_dir"], role)
         os.makedirs(dest_dir, exist_ok=True)
         final_path = os.path.join(dest_dir, filename)
         part_path = final_path + ".part"
@@ -343,7 +347,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._plain(400, f"upload truncated ({length - remaining}/{length} bytes)")
         os.replace(part_path, final_path)   # only appears complete, never half-written
 
-        self._log_resolution("upload-current", {"os": os_name, "installer": installer},
+        self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer},
                              f"stored {filename} ({length}B)")
         self._plain(200, f"stored {filename} ({length}B)\n")
 
@@ -511,7 +515,8 @@ def main(argv=None):
     base_url = server.start()
     print(base_url, flush=True)
     print("variants: " + ", ".join(sorted(VARIANTS)), flush=True)
-    print("plus: /download-current/<os>/<installer>  and  PUT /upload-current/<os>/<installer>", flush=True)
+    print("plus: /download-<current|newer|older>/<os>/<installer>  "
+          "and  PUT /upload-<current|newer|older>/<os>/<installer>", flush=True)
     print_artifact_report()
     print("Ctrl-C to stop.", flush=True)
     try:

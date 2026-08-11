@@ -272,9 +272,10 @@ def close_browser_at_path(target, browser_path, launched_process):
         pids.add(launched_process.pid)
     if not pids:
         print(f"no browser processes to close (matched against {_norm_path(browser_path)})")
-        return
+        return False
     print(f"closing browser pids at {browser_path}: {sorted(pids)}")
     target.close_pids(pids)
+    return True
 
 
 def wait_for_update(target, browser_path, start_version, expect_version, timeout, poll_interval):
@@ -301,6 +302,7 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
     print(f"version before update: {start_version}")
 
     process = start_browser(browser_path, server_url, variant)
+    closed = False
     try:
         changed, last_seen = wait_for_update(target, browser_path, start_version,
                                              expect_version, timeout, poll_interval)
@@ -319,6 +321,12 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
         check_target = expect_version if expect_version is not None else last_seen
         failures.extend(target.post_relaunch_check(browser_path, start_version, check_target))
 
+        found = close_browser_at_path(target, browser_path, process)
+        closed = True
+        if not found:
+            failures.append("no browser processes found to close -- "
+                            "browser may have crashed or failed to relaunch")
+
         if failures:
             print("\nRESULT: FAIL")
             for failure in failures:
@@ -327,7 +335,8 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
         print(f"\nRESULT: PASS (version {start_version} -> {last_seen})")
         return 0
     finally:
-        close_browser_at_path(target, browser_path, process)
+        if not closed:
+            close_browser_at_path(target, browser_path, process)
 
 
 def main(argv=None):

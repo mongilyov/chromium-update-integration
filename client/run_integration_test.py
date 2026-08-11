@@ -49,6 +49,15 @@ def _norm_path(path):
     return os.path.normcase(os.path.realpath(path))
 
 
+def _bundle_path(executable_path):
+    path = os.path.realpath(executable_path)
+    while path not in ("/", ""):
+        if path.endswith(".app"):
+            return path
+        path = os.path.dirname(path)
+    raise RuntimeError(f"no .app bundle found above {executable_path}")
+
+
 def start_browser(browser_path, server_url, variant):
     update_server = f"{server_url.rstrip('/')}/{variant}"
     command = [browser_path, *BROWSER_UPDATE_FLAGS, f"{BROWSER_SERVER_FLAG}={update_server}"]
@@ -94,7 +103,7 @@ class Platform:
             except (ProcessLookupError, PermissionError, OSError):
                 pass
 
-    def post_relaunch_check(self, browser_path):
+    def post_relaunch_check(self, browser_path, start_version, expect_version):
         return []
 
 
@@ -115,6 +124,8 @@ class LinuxPlatform(Platform):
 
 
 class MacOSPlatform(Platform):
+    FRAMEWORK_VERSIONS_SUBPATH = "Contents/Frameworks/Chromium-Gost Framework.framework/Versions"
+
     def pids_for_executable(self, exe_path):
         wanted = _norm_path(exe_path)
         output = subprocess.run(["ps", "-eo", "pid=,comm="],
@@ -129,8 +140,34 @@ class MacOSPlatform(Platform):
                     pass
         return pids
 
-    def post_relaunch_check(self, browser_path):
-        return []
+    def post_relaunch_check(self, browser_path, start_version, expect_version):
+        try:
+            bundle_path = _bundle_path(browser_path)
+        except RuntimeError as error:
+            return [str(error)]
+
+        versions_dir = os.path.join(bundle_path, self.FRAMEWORK_VERSIONS_SUBPATH)
+        if not os.path.isdir(versions_dir):
+            return [f"versions directory not found: {versions_dir}"]
+
+        failures = []
+
+        if start_version and os.path.isdir(os.path.join(versions_dir, start_version)):
+            failures.append(f"old version folder still present: "
+                            f"{os.path.join(versions_dir, start_version)}")
+
+        current_link = os.path.join(versions_dir, "Current")
+        try:
+            current_target = os.path.basename(os.readlink(current_link))
+        except OSError as error:
+            return failures + [f"could not read Current symlink: {error}"]
+
+        if expect_version is not None and current_target != expect_version:
+            failures.append(f"Current points to {current_target}, expected {expect_version}")
+        elif expect_version is None and start_version is not None and current_target == start_version:
+            failures.append(f"Current still points to the old version {start_version}")
+
+        return failures
 
 
 class WindowsPlatform(Platform):
@@ -279,7 +316,8 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
 
         print(f"waiting {relaunch_grace:.1f}s for relaunch...")
         time.sleep(relaunch_grace)
-        failures.extend(target.post_relaunch_check(browser_path))
+        check_target = expect_version if expect_version is not None else last_seen
+        failures.extend(target.post_relaunch_check(browser_path, start_version, check_target))
 
         if failures:
             print("\nRESULT: FAIL")

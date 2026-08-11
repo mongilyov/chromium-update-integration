@@ -263,6 +263,9 @@ def current_platform():
     return platform_class()
 
 
+CLEANUP_VERIFY_DELAY_SECONDS = 0.5
+
+
 def close_browser_at_path(target, browser_path, launched_process):
     try:
         pids = target.pids_for_executable(browser_path)
@@ -272,10 +275,26 @@ def close_browser_at_path(target, browser_path, launched_process):
         pids.add(launched_process.pid)
     if not pids:
         print(f"no browser processes to close (matched against {_norm_path(browser_path)})")
-        return False
+        return ["no browser processes found to close -- "
+               "browser may have crashed or failed to relaunch"]
+
     print(f"closing browser pids at {browser_path}: {sorted(pids)}")
     target.close_pids(pids)
-    return True
+
+    time.sleep(CLEANUP_VERIFY_DELAY_SECONDS)
+    try:
+        remaining = target.pids_for_executable(browser_path)
+    except Exception:
+        remaining = set()
+    if launched_process.poll() is None:
+        remaining = remaining | {launched_process.pid}
+    still_alive = pids & remaining
+
+    if still_alive:
+        print(f"still running after close: {sorted(still_alive)}")
+        return [f"browser process(es) survived close: {sorted(still_alive)}"]
+    print("confirmed browser closed")
+    return []
 
 
 def wait_for_update(target, browser_path, start_version, expect_version, timeout, poll_interval):
@@ -318,14 +337,13 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
 
         print(f"waiting {relaunch_grace:.1f}s for relaunch...")
         time.sleep(relaunch_grace)
+
+        cleanup_issues = close_browser_at_path(target, browser_path, process)
+        closed = True
+        failures.extend(cleanup_issues)
+
         check_target = expect_version if expect_version is not None else last_seen
         failures.extend(target.post_relaunch_check(browser_path, start_version, check_target))
-
-        found = close_browser_at_path(target, browser_path, process)
-        closed = True
-        if not found:
-            failures.append("no browser processes found to close -- "
-                            "browser may have crashed or failed to relaunch")
 
         if failures:
             print("\nRESULT: FAIL")

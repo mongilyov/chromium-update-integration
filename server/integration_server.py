@@ -76,7 +76,10 @@ ARTIFACTS = {
             "timestamp": "03.08.2026",
         },
         "rpm": {"signature": "", "timestamp": ""},
-        "tar": {"signature": "", "timestamp": ""},
+        "tar": {
+            "signature": "17E4F281B8EA204BD9AEBD2D819634E6EE3DD603D41730E08C3DF1720AA0DDC6624A51971C59678DA2D44F40208F12560C2E8D697CDC9A927D0AEA5503EE6523",
+            "timestamp": "12.08.2026"
+        },
     },
     "older": {
         "exe": {"signature": "", "timestamp": ""},

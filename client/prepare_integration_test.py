@@ -156,7 +156,7 @@ class MacOSPlatform(Platform):
 
     def install(self, package_path):
         with tempfile.TemporaryDirectory(prefix="mac-bundle-") as tmp:
-            self._run(["tar", "-xjf", package_path, "-C", tmp], "extract tarball")
+            self._run(["tar", "-xzf", package_path, "-C", tmp], "extract tarball")
             extracted_app = os.path.join(tmp, self.APP_NAME)
             if not os.path.isdir(extracted_app):
                 raise RuntimeError(f"{self.APP_NAME} not found at top level of the tarball")

@@ -58,14 +58,17 @@ def _bundle_path(executable_path):
     raise RuntimeError(f"no .app bundle found above {executable_path}")
 
 
-def start_browser(browser_path, server_url, variant):
+def start_browser(browser_path, server_url, variant, extra_flags=()):
     update_server = f"{server_url.rstrip('/')}/{variant}"
-    command = [browser_path, *BROWSER_UPDATE_FLAGS, f"{BROWSER_SERVER_FLAG}={update_server}"]
+    command = [browser_path, *BROWSER_UPDATE_FLAGS, *extra_flags,
+              f"{BROWSER_SERVER_FLAG}={update_server}"]
     print(f"launching: {' '.join(command)}", flush=True)
     return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 class Platform:
+    EXTRA_LAUNCH_FLAGS = []
+
     def installed_version(self, browser_path):
         completed = subprocess.run([browser_path, BROWSER_VERSION_FLAG],
                                    capture_output=True, text=True)
@@ -125,6 +128,7 @@ class LinuxPlatform(Platform):
 
 class MacOSPlatform(Platform):
     FRAMEWORK_VERSIONS_SUBPATH = "Contents/Frameworks/Chromium-Gost Framework.framework/Versions"
+    EXTRA_LAUNCH_FLAGS = ["--use-mock-keychain", "--disable-features=DialMediaRouteProvider"]
 
     def pids_for_executable(self, exe_path):
         wanted = _norm_path(exe_path)
@@ -320,7 +324,7 @@ def run_case(browser_path, server_url, variant, expect_version, timeout, poll_in
     start_version = target.read_version(browser_path)
     print(f"version before update: {start_version}")
 
-    process = start_browser(browser_path, server_url, variant)
+    process = start_browser(browser_path, server_url, variant, target.EXTRA_LAUNCH_FLAGS)
     closed = False
     try:
         changed, last_seen = wait_for_update(target, browser_path, start_version,

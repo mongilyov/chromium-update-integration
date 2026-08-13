@@ -2,9 +2,9 @@
 """
 integration_server.py
 
-Server for integration tests of a Chromium-Gost auto-updater. Serves pre-signed
-artifacts dropped on disk under artifacts/<role>/ -- version from version.txt, filenames
-derived by convention.
+Server for integration tests of a Chromium-Gost auto-updater.
+Serves pre-signed artifacts dropped on disk under artifacts/<role>/.
+Version and signatures come from artifacts/<role>/config.yaml
 
 Endpoints:
     /<variant>/update
@@ -13,7 +13,8 @@ Endpoints:
     PUT /upload-<current|newer|older>/<os>/<installer>
 
 Usage:
-    python integration_server.py [--host H] [--port P] [--artifacts DIR] [--quiet]
+    python integration_server.py --key-container <container> [--host H] [--port P]
+                                 [--artifacts DIR] [--cpverify PATH] [--quiet]
 """
 
 
@@ -21,13 +22,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import locale
 import os
+import re
 import ssl
+import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import yaml
 
 
 REQ_OS_FIELD = "os"
@@ -58,35 +64,25 @@ INSTALLER_EXT = {
 TARGETS = (("windows", "exe"), ("linux", "deb"), ("linux", "rpm"), ("macos", "tar"))
 
 ALL_ROLES = ("current", "newer", "older")
-VERSION_FILE = "version.txt"
+SIGNED_ROLES = ("newer", "older")
+
+CONFIG_FILE = "config.yaml"
+VERSION_KEY = "version"
+VERIFICATION_KEY = "verification"
+SIGNATURE_KEY = "signature"
+TIMESTAMP_KEY = "timestamp"
+
+CPVERIFY_WINDOWS = r"C:\Program Files (x86)\Crypto Pro\CSP\cpverify.exe"
+CPVERIFY_POSIX = "/opt/cprocsp/bin/amd64/cpverify"
+GOST_PROVTYPE = "80"
+SIGNATURE_RE = re.compile(r"([0-9A-F]{64,})[ \t]+(\d{2}\.\d{2}\.\d{4})")
 
 CONFIG = {
     "artifacts_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts"),
     "hang_seconds": 3600,
-}
-
-ARTIFACTS = {
-    "newer": {
-        "exe": {
-            "signature": "BC1DECA8C97114B1A8EC4A4E3C6F59CF290593F15D4D6EFC00F5ED83A57316A30B3AD96CE9FB50D0D1E80681A3922335DEE6B281B028E2533276DFAD2A649307",
-            "timestamp": "05.08.2026",
-        },
-        "deb": {
-            "signature": "8B58311EC89DE57A5D4F8FB9D8DE9E8BFA6205B036F58AD46E884C40DD7263C1A2854B60E33A9F1ACC2B2331D10C89963C16A8B98F517D9459185153BBC09951",
-            "timestamp": "03.08.2026",
-        },
-        "rpm": {"signature": "", "timestamp": ""},
-        "tar": {
-            "signature": "AFC72693BF35C1561E32F7C2FF5FF81FDD9F839037CB153A020A2984BAB2CE47E9D1494779052D1721D6A71871088FB83A1C51FBFE85ADEE474C769515921918",
-            "timestamp": "12.08.2026"
-        },
-    },
-    "older": {
-        "exe": {"signature": "", "timestamp": ""},
-        "deb": {"signature": "", "timestamp": ""},
-        "rpm": {"signature": "", "timestamp": ""},
-        "tar": {"signature": "", "timestamp": ""},
-    },
+    "cpverify_path": CPVERIFY_WINDOWS if os.name == "nt" else CPVERIFY_POSIX,
+    "key_container": None,
+    "sign_timeout": 120,
 }
 
 VARIANTS = {
@@ -104,6 +100,88 @@ class ConfigError(Exception):
     pass
 
 
+def config_path(role):
+    return os.path.join(CONFIG["artifacts_dir"], role, CONFIG_FILE)
+
+
+def _scalar(value):
+    """An absent value parses as None; everything is kept as a string."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def load_role_config(role):
+    if role not in ALL_ROLES:
+        raise ConfigError(f"unknown role '{role}'; expected one of {ALL_ROLES}")
+    path = config_path(role)
+    if not os.path.isfile(path):
+        raise ConfigError(f"missing config file: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        try:
+            data = yaml.safe_load(handle) or {}
+        except yaml.YAMLError as error:
+            raise ConfigError(f"{path}: invalid YAML: {error}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a mapping at the top level")
+
+    version = _scalar(data.get(VERSION_KEY))
+    if not version:
+        raise ConfigError(f"{path}: missing or empty '{VERSION_KEY}'")
+
+    raw_verification = data.get(VERIFICATION_KEY)
+    if raw_verification and not isinstance(raw_verification, dict):
+        raise ConfigError(f"{path}: '{VERIFICATION_KEY}' must be a mapping")
+    verification = {}
+    for installer, meta in (raw_verification or {}).items():
+        if installer not in INSTALLER_VALUES:
+            raise ConfigError(f"{path}: unknown installer '{installer}' under "
+                              f"'{VERIFICATION_KEY}'; expected one of {INSTALLER_VALUES}")
+        if meta and not isinstance(meta, dict):
+            raise ConfigError(f"{path}: '{VERIFICATION_KEY}.{installer}' must be a mapping")
+        meta = meta or {}
+        verification[installer] = {
+            SIGNATURE_KEY: _scalar(meta.get(SIGNATURE_KEY)),
+            TIMESTAMP_KEY: _scalar(meta.get(TIMESTAMP_KEY)),
+        }
+    return {VERSION_KEY: version, VERIFICATION_KEY: verification}
+
+
+def save_role_config(role, config):
+    """Rewrite artifacts/<role>/config.yaml with a stable key order."""
+    verification = config.get(VERIFICATION_KEY, {})
+    document = {
+        VERSION_KEY: str(config[VERSION_KEY]),
+        VERIFICATION_KEY: {
+            installer: {
+                SIGNATURE_KEY: str(verification.get(installer, {}).get(SIGNATURE_KEY, "")),
+                TIMESTAMP_KEY: str(verification.get(installer, {}).get(TIMESTAMP_KEY, "")),
+            }
+            for installer in INSTALLER_VALUES
+        },
+    }
+    path = config_path(role)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(document, handle, sort_keys=False, default_flow_style=False,
+                       allow_unicode=True)
+    os.replace(temp_path, path)                 # readers never see a half-written config
+    return path
+
+
+def record_signature(role, installer, signature, timestamp):
+    """Merge one signature/timestamp pair into artifacts/<role>/config.yaml."""
+    if installer not in INSTALLER_VALUES:
+        raise ConfigError(f"unknown installer '{installer}'; expected one of {INSTALLER_VALUES}")
+    config = load_role_config(role)
+    config[VERIFICATION_KEY][installer] = {
+        SIGNATURE_KEY: str(signature or ""),
+        TIMESTAMP_KEY: str(timestamp or ""),
+    }
+    return save_role_config(role, config)
+
+
 def _version_key(version):
     return tuple(int(part) for part in version.split("."))
 
@@ -117,14 +195,7 @@ def payload_filename(version, os_name, installer):
 
 
 def role_version(role):
-    path = os.path.join(CONFIG["artifacts_dir"], role, VERSION_FILE)
-    if not os.path.isfile(path):
-        raise ConfigError(f"missing version file: {path}")
-    with open(path, "r", encoding="utf-8") as handle:
-        version = handle.read().strip()
-    if not version:
-        raise ConfigError(f"empty version file: {path}")
-    return version
+    return load_role_config(role)[VERSION_KEY]
 
 
 def payload_path(role, os_name, installer):
@@ -137,40 +208,79 @@ def payload_path(role, os_name, installer):
 
 
 def signature_meta(role, installer):
-    role_meta = ARTIFACTS.get(role)
-    if role_meta is None:
-        raise ConfigError(f"no signature metadata for role '{role}'")
-    meta = role_meta.get(installer)
+    if installer not in INSTALLER_VALUES:
+        raise ConfigError(f"unknown installer '{installer}'; expected one of {INSTALLER_VALUES}")
+    verification = load_role_config(role)[VERIFICATION_KEY]
+    meta = verification.get(installer)
     if meta is None:
-        raise ConfigError(f"no signature metadata for role '{role}', installer '{installer}'")
+        raise ConfigError(f"no '{VERIFICATION_KEY}.{installer}' entry in {config_path(role)}")
     return meta
 
 
-def build_response(variant_name, variant, os_name, installer, client_version, base_url):
-    role = variant["role"]
-    offered_version = role_version(role)
-    available = (variant.get("force_available")
-                 or _version_key(offered_version) > _version_key(client_version))
-    if not available:
-        return {RESP_AVAILABLE_FIELD: False}
-    _, filename = payload_path(role, os_name, installer)
-    meta = signature_meta(role, installer)
-    quoted = urllib.parse.quote(filename)
-    return {
-        RESP_AVAILABLE_FIELD: True,
-        RESP_VERSION_FIELD: offered_version,
-        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{os_name}/{installer}/{quoted}",
-        RESP_SIG_FIELD: meta["signature"],
-        RESP_TS_FIELD: meta["timestamp"],
-    }
+def _decode(raw):
+    for encoding in (locale.getpreferredencoding(False), "utf-8", "cp866"):
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
 
 
-def _corrupt(data):
-    if not data:
-        return b"\x00"
-    corrupted = bytearray(data)
-    corrupted[len(corrupted) // 2] ^= 0xFF
-    return bytes(corrupted)
+def _parse_cpverify_output(output):
+    """cpverify prints '<signature-hex> <dd.mm.yyyy>'; ignore any chatter around it."""
+    match = SIGNATURE_RE.search(output)
+    if match is None:
+        raise ConfigError(f"cannot parse '<signature> <timestamp>' from cpverify output: "
+                          f"{output.strip()!r}")
+    return match.group(1), match.group(2)
+
+
+def _run_cpverify(path, container):
+    executable = CONFIG["cpverify_path"]
+    if not os.path.isfile(executable):
+        raise ConfigError(f"cpverify not found at {executable} (override with --cpverify)")
+    command = [executable, "-file_sign", path, "-cont", container, "-provtype", GOST_PROVTYPE]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=CONFIG["sign_timeout"])
+    except OSError as error:
+        raise ConfigError(f"cannot run {executable}: {error}")
+    except subprocess.TimeoutExpired:
+        raise ConfigError(f"cpverify timed out after {CONFIG['sign_timeout']}s on {path}")
+    stdout = _decode(result.stdout)
+    if result.returncode != 0:
+        detail = (_decode(result.stderr) or stdout).strip()
+        raise ConfigError(f"cpverify exited {result.returncode} on {path}: {detail}")
+    return stdout
+
+
+def sign_artifact(role, os_name, installer, path=None):
+    """Produce (signature, timestamp) for a payload, using cpverify -file_sign.
+
+    `path` signs a staged file that is not at its final name yet (the upload handler
+    passes the .part), and defaults to the published artifact. The key container comes
+    from --key-container; no PIN is sent and provtype is always 80. Both halves of the
+    result are cpverify's own -- the timestamp is not re-derived from the local clock.
+
+    Pure: it signs and returns, it does not touch config.yaml. Persisting is the
+    caller's job via record_signature() -- sign_and_record() below does both.
+    """
+    container = CONFIG["key_container"]
+    if not container:
+        raise ConfigError("no key container configured; start the server with --key-container")
+    if path is None:
+        path, _ = payload_path(role, os_name, installer)
+    if not os.path.isfile(path):
+        raise ConfigError(f"nothing to sign at {path}")
+    return _parse_cpverify_output(_run_cpverify(path, container))
+
+
+def sign_and_record(role, os_name, installer, path=None):
+    """Sign a payload and write the result into its role's config.yaml."""
+    signature, timestamp = sign_artifact(role, os_name, installer, path)
+    record_signature(role, installer, signature, timestamp)
+    return signature, timestamp
 
 
 def artifact_report():
@@ -199,15 +309,42 @@ def print_artifact_report(file=sys.stdout):
     for role, os_name, installer, version, path, exists in rows:
         label = f"{role}/{os_name}/{installer}".ljust(width)
         if version is None:
-            print(f"  [NO VERSION] {label}  (missing {role}/{VERSION_FILE})", file=file)
+            print(f"  [NO CONFIG ] {label}  (bad or missing {role}/{CONFIG_FILE})", file=file)
             problems += 1
             continue
-        status = "OK     " if exists else "MISSING"
+        status = "OK        " if exists else "NO PAYLOAD"
         if not exists:
             problems += 1
         print(f"  [{status}] {label}  v{version}  {path}", file=file)
     if problems:
         print(f"  -> {problems} problem(s); those requests will 500 until fixed.", file=file)
+
+
+def build_response(variant_name, variant, os_name, installer, client_version, base_url):
+    role = variant["role"]
+    offered_version = role_version(role)
+    available = (variant.get("force_available")
+                 or _version_key(offered_version) > _version_key(client_version))
+    if not available:
+        return {RESP_AVAILABLE_FIELD: False}
+    _, filename = payload_path(role, os_name, installer)
+    meta = signature_meta(role, installer)
+    quoted = urllib.parse.quote(filename)
+    return {
+        RESP_AVAILABLE_FIELD: True,
+        RESP_VERSION_FIELD: offered_version,
+        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{os_name}/{installer}/{quoted}",
+        RESP_SIG_FIELD: meta[SIGNATURE_KEY],
+        RESP_TS_FIELD: meta[TIMESTAMP_KEY],
+    }
+
+
+def _corrupt(data):
+    if not data:
+        return b"\x00"
+    corrupted = bytearray(data)
+    corrupted[len(corrupted) // 2] ^= 0xFF
+    return bytes(corrupted)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -348,11 +485,23 @@ class _Handler(BaseHTTPRequestHandler):
         if remaining != 0:
             os.remove(part_path)
             return self._plain(400, f"upload truncated ({length - remaining}/{length} bytes)")
-        os.replace(part_path, final_path)   # only appears complete, never half-written
+
+        note = ""
+        if role in SIGNED_ROLES:
+            try:
+                signature, timestamp = sign_and_record(role, os_name, installer, part_path)
+            except ConfigError as error:
+                os.remove(part_path)        # never publish an unsigned artifact
+                self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer},
+                                     f"rejected {filename}: signing failed: {error}")
+                return self._plain(500, f"signing failed, {filename} not stored: {error}")
+            note = f"; signed {timestamp} {signature[:16]}..."
+
+        os.replace(part_path, final_path)   # only appears complete and signed, never half-written
 
         self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer},
-                             f"stored {filename} ({length}B)")
-        self._plain(200, f"stored {filename} ({length}B)\n")
+                             f"stored {filename} ({length}B){note}")
+        self._plain(200, f"stored {filename} ({length}B){note}\n")
 
     def _log_resolution(self, name, telemetry, outcome):
         sys.stderr.write(f"[server] {name} request={telemetry!r} -> {outcome!r}\n")
@@ -500,6 +649,12 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--artifacts", default=None)
+    parser.add_argument("--key-container", "--key_container", dest="key_container",
+                        required=True,
+                        help="CryptoPro key container used to sign uploaded artifacts "
+                             "(no PIN, provtype 80)")
+    parser.add_argument("--cpverify", default=CONFIG["cpverify_path"],
+                        help="path to cpverify (default: %(default)s)")
     parser.add_argument("--tls-cert", default=None)
     parser.add_argument("--tls-key", default=None)
     parser.add_argument("--quiet", action="store_true",
@@ -509,6 +664,8 @@ def main(argv=None):
 
     if args.artifacts:
         CONFIG["artifacts_dir"] = args.artifacts
+    CONFIG["key_container"] = args.key_container
+    CONFIG["cpverify_path"] = args.cpverify
 
     print(f"running: {os.path.abspath(__file__)}", flush=True)
     print(f"pid: {os.getpid()}", flush=True)
@@ -520,6 +677,9 @@ def main(argv=None):
     print("variants: " + ", ".join(sorted(VARIANTS)), flush=True)
     print("plus: /download-<current|newer|older>/<os>/<installer>  "
           "and  PUT /upload-<current|newer|older>/<os>/<installer>", flush=True)
+    print(f"uploads to {', '.join(SIGNED_ROLES)} are signed on arrival with "
+          f"{CONFIG['cpverify_path']} (container {CONFIG['key_container']}); "
+          f"an upload that cannot be signed is rejected", flush=True)
     print_artifact_report()
     print("Ctrl-C to stop.", flush=True)
     try:
@@ -529,7 +689,8 @@ def main(argv=None):
         pass
     finally:
         server.stop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

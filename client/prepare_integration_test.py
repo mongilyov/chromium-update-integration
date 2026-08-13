@@ -4,12 +4,16 @@ prepare_integration_testing.py
 
 Put the machine into a known baseline before the update test: remove the currently
 installed browser, then install the "current" build fetched from the server's
-/download-current/<os>/<installer>. Each OS's remove/install logic and constants live in
+/download-current/<target>. Each OS's remove/install logic and constants live in
 its own Platform subclass; prepare() picks one and drives it through the shared steps.
+
+Targets are the server's: windows, macos, linux_deb, linux_rpm. Each platform knows
+which ones it can handle and defaults to one, so --target is only needed on Linux to
+choose rpm over deb.
 
 Usage:
     python prepare_integration_testing.py [--server <url>]
-        [--os linux] [--installer deb] [--package <path>] [--timeout 120]
+        [--target linux_rpm] [--package <path>] [--timeout 120]
 
 URL can be passed as an environment variable.
 """
@@ -26,13 +30,21 @@ import tempfile
 import urllib.request
 
 
-SERVER_ENV_VARIABLE='CHROMIUM_TEST_UPDATE_SERVER_URL'
+SERVER_ENV_VARIABLE = 'CHROMIUM_TEST_UPDATE_SERVER_URL'
+
+TARGETS = ("windows", "macos", "linux_deb", "linux_rpm")
 
 
 class Platform:
 
-    OS_NAME = None
-    DEFAULT_INSTALLER = None
+    TARGETS = ()
+    DEFAULT_TARGET = None
+
+    def __init__(self, target=None):
+        if target is not None and target not in self.TARGETS:
+            raise ValueError(f"{type(self).__name__} cannot handle target '{target}'; "
+                             f"expected one of {self.TARGETS}")
+        self.target = target or self.DEFAULT_TARGET
 
     def require_privileges(self):
         pass
@@ -43,46 +55,48 @@ class Platform:
     def install(self, package_path):
         raise NotImplementedError(f"install not implemented for {type(self).__name__}")
 
+    @staticmethod
+    def _run(command, what, ok_codes=(0,)):
+        printable = command if isinstance(command, str) else " ".join(command)
+        print(f"{what}: {printable}")
+        result = subprocess.run(command, capture_output=True, text=True)
+        sys.stdout.write(result.stdout or "")
+        if result.returncode not in ok_codes:
+            sys.stderr.write(result.stderr or "")
+            raise RuntimeError(f"{what} failed (exit {result.returncode})")
+        return result
+
 
 class LinuxPlatform(Platform):
-    OS_NAME = "linux"
-    DEFAULT_INSTALLER = "deb"
+    TARGETS = ("linux_deb", "linux_rpm")
+    DEFAULT_TARGET = "linux_deb"
     PACKAGE_NAME = "chromium-gost-stable"
+
+    # target -> (query installed, remove, install)
+    COMMANDS = {
+        "linux_deb": (["dpkg", "-s"], ["apt", "remove", "-y"], ["apt", "install", "-y"]),
+        "linux_rpm": (["rpm", "-q"], ["dnf", "remove", "-y"], ["dnf", "install", "-y"]),
+    }
 
     def require_privileges(self):
         if os.geteuid() != 0:
-            raise RuntimeError("must run as root (use sudo) -- apt remove/install need it")
+            raise RuntimeError("must run as root (use sudo) -- package remove/install need it")
 
     def remove(self):
-        if not self._dpkg_installed(self.PACKAGE_NAME):
+        query, remove, _ = self.COMMANDS[self.target]
+        if subprocess.run(query + [self.PACKAGE_NAME], capture_output=True).returncode != 0:
             print(f"{self.PACKAGE_NAME} is not installed; nothing to remove")
             return
-        print(f"removing {self.PACKAGE_NAME} via apt...")
-        result = subprocess.run(["apt", "remove", "-y", self.PACKAGE_NAME],
-                                capture_output=True, text=True)
-        sys.stdout.write(result.stdout)
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            raise RuntimeError(f"apt remove failed (exit {result.returncode})")
+        self._run(remove + [self.PACKAGE_NAME], f"remove {self.PACKAGE_NAME}")
 
     def install(self, package_path):
-        print(f"installing {package_path} via apt...")
-        result = subprocess.run(["apt", "install", "-y", package_path],
-                                capture_output=True, text=True)
-        sys.stdout.write(result.stdout)
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            raise RuntimeError(f"apt install failed (exit {result.returncode})")
-
-    @staticmethod
-    def _dpkg_installed(package):
-        result = subprocess.run(["dpkg", "-s", package], capture_output=True, text=True)
-        return result.returncode == 0
+        _, _, install = self.COMMANDS[self.target]
+        self._run(install + [package_path], f"install {package_path}")
 
 
 class WindowsPlatform(Platform):
-    OS_NAME = "windows"
-    DEFAULT_INSTALLER = "exe"
+    TARGETS = ("windows",)
+    DEFAULT_TARGET = "windows"
 
     UNINSTALL_KEY = r"Software\Chromium"
     UNINSTALL_STRING_VALUE = "UninstallString"
@@ -113,29 +127,18 @@ class WindowsPlatform(Platform):
             command_line = f"{command_line} {uninstall_args}"
         if self.UNINSTALL_FLAGS:
             command_line = f"{command_line} {' '.join(self.UNINSTALL_FLAGS)}"
-        print(f"running uninstall: {command_line}")
-        result = subprocess.run(command_line, capture_output=True, text=True)
-        sys.stdout.write(result.stdout or "")
-        if result.returncode not in self.UNINSTALL_OK_CODES:
-            sys.stderr.write(result.stderr or "")
-            raise RuntimeError(f"uninstall failed (exit {result.returncode})")
+        result = self._run(command_line, "uninstall", ok_codes=self.UNINSTALL_OK_CODES)
         if result.returncode != 0:
             print(f"uninstall succeeded with exit {result.returncode} "
                   f"(reboot may be needed to finish removing files)")
 
     def install(self, package_path):
-        command = [package_path] + self.INSTALL_FLAGS
-        print(f"installing: {command}")
-        result = subprocess.run(command, capture_output=True, text=True)
-        sys.stdout.write(result.stdout or "")
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr or "")
-            raise RuntimeError(f"installer failed (exit {result.returncode})")
+        self._run([package_path] + self.INSTALL_FLAGS, f"install {package_path}")
 
 
 class MacOSPlatform(Platform):
-    OS_NAME = "macos"
-    DEFAULT_INSTALLER = "tar"
+    TARGETS = ("macos",)
+    DEFAULT_TARGET = "macos"
 
     APP_NAME = "Chromium-Gost.app"
     APP_PATH = "/Applications/Chromium-Gost.app"
@@ -169,15 +172,6 @@ class MacOSPlatform(Platform):
             os.makedirs(self.PRIVILEGED_HELPER_DIR, exist_ok=True)
             self._run(["ditto", helper_src, helper_dest], "install privileged helper (in place)")
 
-    @staticmethod
-    def _run(command, what):
-        print(f"{what}: {' '.join(command)}")
-        result = subprocess.run(command, capture_output=True, text=True)
-        sys.stdout.write(result.stdout or "")
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr or "")
-            raise RuntimeError(f"{what} failed (exit {result.returncode})")
-
 
 PLATFORMS = {
     "Linux": LinuxPlatform,
@@ -186,12 +180,12 @@ PLATFORMS = {
 }
 
 
-def current_platform():
+def current_platform(target=None):
     system = platform.system()
     platform_class = PLATFORMS.get(system)
     if platform_class is None:
         raise NotImplementedError(f"no platform support for '{system}'")
-    return platform_class()
+    return platform_class(target)
 
 
 def normalize_server_url(server_url):
@@ -207,13 +201,13 @@ def _filename_from_disposition(disposition):
     return match.group(1) if match else None
 
 
-def download_baseline(server_url, os_name, installer, dest_dir, timeout):
-    url = f"{server_url.rstrip('/')}/download-current/{os_name}/{installer}"
+def download_baseline(server_url, target, dest_dir, timeout):
+    url = f"{server_url.rstrip('/')}/download-current/{target}"
     print(f"downloading baseline from {url} ...")
     with urllib.request.urlopen(url, timeout=timeout) as response:
         disposition = response.headers.get("Content-Disposition", "")
         data = response.read()
-    filename = _filename_from_disposition(disposition) or f"baseline-{os_name}-{installer}"
+    filename = _filename_from_disposition(disposition) or f"baseline-{target}"
     path = os.path.join(dest_dir, filename)
     with open(path, "wb") as handle:
         handle.write(data)
@@ -221,26 +215,22 @@ def download_baseline(server_url, os_name, installer, dest_dir, timeout):
     return path
 
 
-def prepare(server_url, os_name, installer, package, timeout):
-    target = current_platform()
-    target.require_privileges()
+def prepare(server_url, target, package, timeout):
+    platform_target = current_platform(target)
+    platform_target.require_privileges()
 
-    os_name = os_name or target.OS_NAME
-    installer = installer or target.DEFAULT_INSTALLER
-
-    target.remove()
+    platform_target.remove()
 
     if package:
-        target.install(os.path.abspath(package))
+        platform_target.install(os.path.abspath(package))
     else:
         if not server_url:
-            raise ValueError("need --server (to fetch the baseline), env variable CHROMIUM_TEST_UPDATE_SERVER_URL or --package")
-        if os_name is None or installer is None:
-            raise ValueError("could not determine os/installer; pass --os and --installer")
+            raise ValueError(f"need --server (to fetch the baseline), env variable "
+                             f"{SERVER_ENV_VARIABLE} or --package")
         with tempfile.TemporaryDirectory(prefix="prepare-baseline-") as tmp:
-            baseline = download_baseline(server_url, os_name, installer, tmp, timeout)
-            target.install(baseline)
-    print("baseline prepared")
+            baseline = download_baseline(server_url, platform_target.target, tmp, timeout)
+            platform_target.install(baseline)
+    print(f"baseline prepared ({platform_target.target})")
 
 
 def main(argv=None):
@@ -249,10 +239,9 @@ def main(argv=None):
     parser.add_argument("--server", default=os.environ.get(SERVER_ENV_VARIABLE),
                         help="base URL of the running update server (for /download-current). "
                         f"Can also be set via {SERVER_ENV_VARIABLE} envrionment variable")
-    parser.add_argument("--os", dest="os_name", default=None,
-                        help="download-current os; defaults to this platform's")
-    parser.add_argument("--installer", default=None,
-                        help="download-current installer; defaults to this platform's")
+    parser.add_argument("--target", default=None, choices=TARGETS,
+                        help="artifact to fetch and install; defaults to this platform's "
+                             "(only Linux has a choice: linux_deb or linux_rpm)")
     parser.add_argument("--package", default=None,
                         help="install this local package instead of fetching from --server")
     parser.add_argument("--timeout", type=float, default=120.0,
@@ -261,7 +250,7 @@ def main(argv=None):
 
     server_url = normalize_server_url(args.server)
     try:
-        prepare(server_url, args.os_name, args.installer, args.package, args.timeout)
+        prepare(server_url, args.target, args.package, args.timeout)
     except NotImplementedError as error:
         print(f"NOT IMPLEMENTED: {error}", file=sys.stderr)
         return 3

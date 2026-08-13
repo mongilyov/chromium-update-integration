@@ -8,9 +8,9 @@ Version and signatures come from artifacts/<role>/config.yaml
 
 Endpoints:
     /<variant>/update
-    /<variant>/download-update/<role>/<os>/<installer>/<file>
-    /download-<current|newer|older>/<os>/<installer>
-    PUT /upload-<current|newer|older>/<os>/<installer>
+    /<variant>/download-update/<role>/<target>/<file>
+    /download-<current|newer|older>/<target>
+    PUT /upload-<current|newer|older>/<target>
 
 Usage:
     python integration_server.py --key-container <container> [--host H] [--port P]
@@ -47,21 +47,16 @@ RESP_SIG_FIELD = "signature"
 RESP_TS_FIELD = "signature_timestamp"
 
 OS_VALUES = ("windows", "linux", "macos")
-INSTALLER_VALUES = ("deb", "rpm", "exe", "tar")
+LINUX_INSTALLERS = ("deb", "rpm")
 
-OS_ARCH = {
-    "windows": "windows-amd64",
-    "linux":   "linux-amd64",
-    "macos":   "macos-arm64",
+# One key per artifact, used in config.yaml, in URLs and on disk.
+TARGETS = ("windows", "macos", "linux_deb", "linux_rpm")
+TARGET_SUFFIX = {
+    "windows":   "windows-amd64-installer.exe",
+    "macos":     "macos-arm64.tar.bz2",
+    "linux_deb": "linux-amd64.deb",
+    "linux_rpm": "linux-amd64.rpm",
 }
-INSTALLER_EXT = {
-    "deb": ".deb",
-    "rpm": ".rpm",
-    "exe": "-installer.exe",
-    "tar": ".tar.bz2",
-}
-
-TARGETS = (("windows", "exe"), ("linux", "deb"), ("linux", "rpm"), ("macos", "tar"))
 
 ALL_ROLES = ("current", "newer", "older")
 SIGNED_ROLES = ("newer", "older")
@@ -100,6 +95,22 @@ class ConfigError(Exception):
     pass
 
 
+def resolve_target(os_name, installer=None):
+    """Map a client's os (+ installer, on Linux only) onto a target key."""
+    if os_name not in OS_VALUES:
+        raise ValueError(f"missing or invalid '{REQ_OS_FIELD}'; expected one of {OS_VALUES}")
+    if os_name != "linux":
+        return os_name
+    if installer not in LINUX_INSTALLERS:
+        raise ValueError(f"missing or invalid '{REQ_INSTALLER_FIELD}' for linux; "
+                         f"expected one of {LINUX_INSTALLERS}")
+    return f"linux_{installer}"
+
+
+# --------------------------------------------------------------------------- #
+# config.yaml handling
+# --------------------------------------------------------------------------- #
+
 def config_path(role):
     return os.path.join(CONFIG["artifacts_dir"], role, CONFIG_FILE)
 
@@ -133,14 +144,14 @@ def load_role_config(role):
     if raw_verification and not isinstance(raw_verification, dict):
         raise ConfigError(f"{path}: '{VERIFICATION_KEY}' must be a mapping")
     verification = {}
-    for installer, meta in (raw_verification or {}).items():
-        if installer not in INSTALLER_VALUES:
-            raise ConfigError(f"{path}: unknown installer '{installer}' under "
-                              f"'{VERIFICATION_KEY}'; expected one of {INSTALLER_VALUES}")
+    for target, meta in (raw_verification or {}).items():
+        if target not in TARGETS:
+            raise ConfigError(f"{path}: unknown target '{target}' under "
+                              f"'{VERIFICATION_KEY}'; expected one of {TARGETS}")
         if meta and not isinstance(meta, dict):
-            raise ConfigError(f"{path}: '{VERIFICATION_KEY}.{installer}' must be a mapping")
+            raise ConfigError(f"{path}: '{VERIFICATION_KEY}.{target}' must be a mapping")
         meta = meta or {}
-        verification[installer] = {
+        verification[target] = {
             SIGNATURE_KEY: _scalar(meta.get(SIGNATURE_KEY)),
             TIMESTAMP_KEY: _scalar(meta.get(TIMESTAMP_KEY)),
         }
@@ -153,11 +164,11 @@ def save_role_config(role, config):
     document = {
         VERSION_KEY: str(config[VERSION_KEY]),
         VERIFICATION_KEY: {
-            installer: {
-                SIGNATURE_KEY: str(verification.get(installer, {}).get(SIGNATURE_KEY, "")),
-                TIMESTAMP_KEY: str(verification.get(installer, {}).get(TIMESTAMP_KEY, "")),
+            target: {
+                SIGNATURE_KEY: str(verification.get(target, {}).get(SIGNATURE_KEY, "")),
+                TIMESTAMP_KEY: str(verification.get(target, {}).get(TIMESTAMP_KEY, "")),
             }
-            for installer in INSTALLER_VALUES
+            for target in TARGETS
         },
     }
     path = config_path(role)
@@ -170,50 +181,50 @@ def save_role_config(role, config):
     return path
 
 
-def record_signature(role, installer, signature, timestamp):
+def record_signature(role, target, signature, timestamp):
     """Merge one signature/timestamp pair into artifacts/<role>/config.yaml."""
-    if installer not in INSTALLER_VALUES:
-        raise ConfigError(f"unknown installer '{installer}'; expected one of {INSTALLER_VALUES}")
+    if target not in TARGETS:
+        raise ConfigError(f"unknown target '{target}'; expected one of {TARGETS}")
     config = load_role_config(role)
-    config[VERIFICATION_KEY][installer] = {
+    config[VERIFICATION_KEY][target] = {
         SIGNATURE_KEY: str(signature or ""),
         TIMESTAMP_KEY: str(timestamp or ""),
     }
     return save_role_config(role, config)
 
 
+# --------------------------------------------------------------------------- #
+# artifacts
+# --------------------------------------------------------------------------- #
+
 def _version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def payload_filename(version, os_name, installer):
-    if os_name not in OS_ARCH:
-        raise ConfigError(f"unknown os '{os_name}'; expected one of {OS_VALUES}")
-    if installer not in INSTALLER_EXT:
-        raise ConfigError(f"unknown installer '{installer}'; expected one of {INSTALLER_VALUES}")
-    return f"chromium-gost-{version}-{OS_ARCH[os_name]}{INSTALLER_EXT[installer]}"
+def payload_filename(version, target):
+    if target not in TARGET_SUFFIX:
+        raise ConfigError(f"unknown target '{target}'; expected one of {TARGETS}")
+    return f"chromium-gost-{version}-{TARGET_SUFFIX[target]}"
 
 
 def role_version(role):
     return load_role_config(role)[VERSION_KEY]
 
 
-def payload_path(role, os_name, installer):
-    version = role_version(role)
-    filename = payload_filename(version, os_name, installer)
+def payload_path(role, target):
+    filename = payload_filename(role_version(role), target)
     path = os.path.join(CONFIG["artifacts_dir"], role, filename)
     if not os.path.isfile(path):
         raise ConfigError(f"payload missing on disk: {path}")
     return path, filename
 
 
-def signature_meta(role, installer):
-    if installer not in INSTALLER_VALUES:
-        raise ConfigError(f"unknown installer '{installer}'; expected one of {INSTALLER_VALUES}")
-    verification = load_role_config(role)[VERIFICATION_KEY]
-    meta = verification.get(installer)
+def signature_meta(role, target):
+    if target not in TARGETS:
+        raise ConfigError(f"unknown target '{target}'; expected one of {TARGETS}")
+    meta = load_role_config(role)[VERIFICATION_KEY].get(target)
     if meta is None:
-        raise ConfigError(f"no '{VERIFICATION_KEY}.{installer}' entry in {config_path(role)}")
+        raise ConfigError(f"no '{VERIFICATION_KEY}.{target}' entry in {config_path(role)}")
     return meta
 
 
@@ -255,7 +266,7 @@ def _run_cpverify(path, container):
     return stdout
 
 
-def sign_artifact(role, os_name, installer, path=None):
+def sign_artifact(role, target, path=None):
     """Produce (signature, timestamp) for a payload, using cpverify -file_sign.
 
     `path` signs a staged file that is not at its final name yet (the upload handler
@@ -270,16 +281,16 @@ def sign_artifact(role, os_name, installer, path=None):
     if not container:
         raise ConfigError("no key container configured; start the server with --key-container")
     if path is None:
-        path, _ = payload_path(role, os_name, installer)
+        path, _ = payload_path(role, target)
     if not os.path.isfile(path):
         raise ConfigError(f"nothing to sign at {path}")
     return _parse_cpverify_output(_run_cpverify(path, container))
 
 
-def sign_and_record(role, os_name, installer, path=None):
+def sign_and_record(role, target, path=None):
     """Sign a payload and write the result into its role's config.yaml."""
-    signature, timestamp = sign_artifact(role, os_name, installer, path)
-    record_signature(role, installer, signature, timestamp)
+    signature, timestamp = sign_artifact(role, target, path)
+    record_signature(role, target, signature, timestamp)
     return signature, timestamp
 
 
@@ -290,24 +301,23 @@ def artifact_report():
             version = role_version(role)
         except ConfigError:
             version = None
-        for os_name, installer in TARGETS:
+        for target in TARGETS:
             if version is None:
-                rows.append((role, os_name, installer, None, None, False))
+                rows.append((role, target, None, None, False))
                 continue
-            filename = payload_filename(version, os_name, installer)
-            path = os.path.join(CONFIG["artifacts_dir"], role, filename)
-            rows.append((role, os_name, installer, version, path, os.path.isfile(path)))
+            path = os.path.join(CONFIG["artifacts_dir"], role,
+                                payload_filename(version, target))
+            rows.append((role, target, version, path, os.path.isfile(path)))
     return rows
 
 
 def print_artifact_report(file=sys.stdout):
     print(f"artifacts_dir = {CONFIG['artifacts_dir']}", file=file)
     rows = artifact_report()
-    width = max((len(f"{role}/{os_name}/{installer}") for role, os_name, installer, *_ in rows),
-                default=8)
+    width = max((len(f"{role}/{target}") for role, target, *_ in rows), default=8)
     problems = 0
-    for role, os_name, installer, version, path, exists in rows:
-        label = f"{role}/{os_name}/{installer}".ljust(width)
+    for role, target, version, path, exists in rows:
+        label = f"{role}/{target}".ljust(width)
         if version is None:
             print(f"  [NO CONFIG ] {label}  (bad or missing {role}/{CONFIG_FILE})", file=file)
             problems += 1
@@ -320,20 +330,24 @@ def print_artifact_report(file=sys.stdout):
         print(f"  -> {problems} problem(s); those requests will 500 until fixed.", file=file)
 
 
-def build_response(variant_name, variant, os_name, installer, client_version, base_url):
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
+
+def build_response(variant_name, variant, target, client_version, base_url):
     role = variant["role"]
     offered_version = role_version(role)
     available = (variant.get("force_available")
                  or _version_key(offered_version) > _version_key(client_version))
     if not available:
         return {RESP_AVAILABLE_FIELD: False}
-    _, filename = payload_path(role, os_name, installer)
-    meta = signature_meta(role, installer)
+    _, filename = payload_path(role, target)
+    meta = signature_meta(role, target)
     quoted = urllib.parse.quote(filename)
     return {
         RESP_AVAILABLE_FIELD: True,
         RESP_VERSION_FIELD: offered_version,
-        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{os_name}/{installer}/{quoted}",
+        RESP_URL_FIELD: f"{base_url}/{variant_name}/download-update/{role}/{target}/{quoted}",
         RESP_SIG_FIELD: meta[SIGNATURE_KEY],
         RESP_TS_FIELD: meta[TIMESTAMP_KEY],
     }
@@ -369,20 +383,18 @@ class _Handler(BaseHTTPRequestHandler):
         parts = path.split("/") if path else []
         if not parts or not parts[0]:
             return self._plain(404, "expected /<variant>/update, "
-                                    "/<variant>/download-update/<role>/<os>/<installer>/<file>, "
-                                    "or /download-<current|newer|older>/<os>/<installer>")
+                                    "/<variant>/download-update/<role>/<target>/<file>, "
+                                    "or /download-<current|newer|older>/<target>")
 
         if parts[0] in ("download-current", "download-newer", "download-older"):
-            if len(parts) < 3:
-                return self._plain(404, f"expected /{parts[0]}/<os>/<installer>")
-            role = parts[0][len("download-"):]
-            return self._serve_role(role, parts[1], parts[2])
+            if len(parts) < 2:
+                return self._plain(404, f"expected /{parts[0]}/<target>")
+            return self._serve_role(parts[0][len("download-"):], parts[1])
 
         if parts[0] in ("upload-current", "upload-newer", "upload-older"):
-            if len(parts) < 3:
-                return self._plain(404, f"expected PUT /{parts[0]}/<os>/<installer>")
-            role = parts[0][len("upload-"):]
-            return self._serve_upload(role, parts[1], parts[2])
+            if len(parts) < 2:
+                return self._plain(404, f"expected PUT /{parts[0]}/<target>")
+            return self._serve_upload(parts[0][len("upload-"):], parts[1])
 
         variant_name = parts[0]
         variant = VARIANTS.get(variant_name)
@@ -396,21 +408,21 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._misbehave(misbehavior)
             return self._serve_check(variant_name, variant)
         if endpoint == "download-update":
-            if len(parts) < 5:
+            if len(parts) < 4:
                 return self._plain(404, "download path is "
-                                        "/<variant>/download-update/<role>/<os>/<installer>/<file>")
-            return self._serve_download(variant, parts[2], parts[3], parts[4])
+                                        "/<variant>/download-update/<role>/<target>/<file>")
+            return self._serve_download(variant, parts[2], parts[3])
         return self._plain(404, "expected /update or "
-                                "/download-update/<role>/<os>/<installer>/<file>")
+                                "/download-update/<role>/<target>/<file>")
 
     def _serve_check(self, variant_name, variant):
         telemetry = self._read_telemetry()
         try:
-            os_name = self._pick(telemetry, REQ_OS_FIELD, OS_VALUES)
-            installer = self._pick(telemetry, REQ_INSTALLER_FIELD, INSTALLER_VALUES)
-            client_version = self._client_version(telemetry)
-            document = build_response(variant_name, variant, os_name, installer,
-                                      client_version, self._request_base_url())
+            target = resolve_target(telemetry.get(REQ_OS_FIELD),
+                                    telemetry.get(REQ_INSTALLER_FIELD))
+            document = build_response(variant_name, variant, target,
+                                      self._client_version(telemetry),
+                                      self._request_base_url())
         except ConfigError as error:
             self._log_resolution(variant_name, telemetry, error)
             return self._plain(500, f"artifact/config not ready: {error}")
@@ -420,49 +432,44 @@ class _Handler(BaseHTTPRequestHandler):
         self._log_resolution(variant_name, telemetry, document)
         self._send(200, "application/json", json.dumps(document, indent=2).encode("utf-8"))
 
-    def _serve_download(self, variant, role, os_name, installer):
+    def _serve_download(self, variant, role, target):
         try:
-            path, filename = payload_path(role, os_name, installer)
+            path, filename = payload_path(role, target)
         except ConfigError as error:
-            self._log_resolution(f"download role={role}", {"os": os_name, "installer": installer}, error)
+            self._log_resolution(f"download role={role}", target, error)
             return self._plain(500, f"artifact/config not ready: {error}")
         with open(path, "rb") as handle:
             data = handle.read()
         if variant.get("corrupt_payload"):
             data = _corrupt(data)
-        self._log_resolution(f"download role={role}", {"os": os_name, "installer": installer},
-                             f"served {filename} ({len(data)}B)")
+        self._log_resolution(f"download role={role}", target, f"served {filename} ({len(data)}B)")
         self._serve_bytes(data, filename)
 
-    def _serve_role(self, role, os_name, installer):
+    def _serve_role(self, role, target):
         try:
-            path, filename = payload_path(role, os_name, installer)
+            path, filename = payload_path(role, target)
         except ConfigError as error:
-            self._log_resolution(f"download-{role}", {"os": os_name, "installer": installer}, error)
+            self._log_resolution(f"download-{role}", target, error)
             status = 400 if "unknown" in str(error) else 500
             return self._plain(status, str(error))
         with open(path, "rb") as handle:
             data = handle.read()
-        self._log_resolution(f"download-{role}", {"os": os_name, "installer": installer},
-                             f"served {filename} ({len(data)}B)")
+        self._log_resolution(f"download-{role}", target, f"served {filename} ({len(data)}B)")
         self._serve_bytes(data, filename)
 
     def _serve_bytes(self, data, filename):
         self._send(200, "application/octet-stream", data,
                    extra_headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-    def _serve_upload(self, role, os_name, installer):
+    def _serve_upload(self, role, target):
         if role not in ALL_ROLES:
             return self._plain(400, f"invalid role '{role}'; expected one of {ALL_ROLES}")
-        if os_name not in OS_VALUES:
-            return self._plain(400, f"invalid os '{os_name}'; expected one of {OS_VALUES}")
-        if installer not in INSTALLER_VALUES:
-            return self._plain(400, f"invalid installer '{installer}'; expected one of {INSTALLER_VALUES}")
+        if target not in TARGETS:
+            return self._plain(400, f"invalid target '{target}'; expected one of {TARGETS}")
         try:
-            version = role_version(role)
-            filename = payload_filename(version, os_name, installer)
+            filename = payload_filename(role_version(role), target)
         except ConfigError as error:
-            self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer}, error)
+            self._log_resolution(f"upload-{role}", target, error)
             return self._plain(500, f"config not ready: {error}")
 
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -489,22 +496,21 @@ class _Handler(BaseHTTPRequestHandler):
         note = ""
         if role in SIGNED_ROLES:
             try:
-                signature, timestamp = sign_and_record(role, os_name, installer, part_path)
+                signature, timestamp = sign_and_record(role, target, part_path)
             except ConfigError as error:
                 os.remove(part_path)        # never publish an unsigned artifact
-                self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer},
+                self._log_resolution(f"upload-{role}", target,
                                      f"rejected {filename}: signing failed: {error}")
                 return self._plain(500, f"signing failed, {filename} not stored: {error}")
             note = f"; signed {timestamp} {signature[:16]}..."
 
         os.replace(part_path, final_path)   # only appears complete and signed, never half-written
 
-        self._log_resolution(f"upload-{role}", {"os": os_name, "installer": installer},
-                             f"stored {filename} ({length}B){note}")
+        self._log_resolution(f"upload-{role}", target, f"stored {filename} ({length}B){note}")
         self._plain(200, f"stored {filename} ({length}B){note}\n")
 
-    def _log_resolution(self, name, telemetry, outcome):
-        sys.stderr.write(f"[server] {name} request={telemetry!r} -> {outcome!r}\n")
+    def _log_resolution(self, name, request, outcome):
+        sys.stderr.write(f"[server] {name} request={request!r} -> {outcome!r}\n")
 
     def _misbehave(self, misbehavior):
         if misbehavior == "http500":
@@ -517,7 +523,7 @@ class _Handler(BaseHTTPRequestHandler):
             sample = {
                 RESP_AVAILABLE_FIELD: True,
                 RESP_VERSION_FIELD: "999.0.0.0",
-                RESP_URL_FIELD: f"{self._request_base_url()}/ok/download-update/newer/linux/deb/installer",
+                RESP_URL_FIELD: f"{self._request_base_url()}/ok/download-update/newer/linux_deb/installer",
                 RESP_SIG_FIELD: "AAAA",
                 RESP_TS_FIELD: "01.01.2024",
             }
@@ -550,12 +556,6 @@ class _Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             fields.update(urllib.parse.parse_qs(body.decode("utf-8", "replace")))
         return {key: value[0] for key, value in fields.items() if value}
-
-    def _pick(self, telemetry, field, allowed):
-        value = telemetry.get(field)
-        if value not in allowed:
-            raise ValueError(f"missing or invalid '{field}'; expected one of {allowed}")
-        return value
 
     def _client_version(self, telemetry):
         value = telemetry.get(REQ_VERSION_FIELD)
@@ -675,8 +675,9 @@ def main(argv=None):
     base_url = server.start()
     print(base_url, flush=True)
     print("variants: " + ", ".join(sorted(VARIANTS)), flush=True)
-    print("plus: /download-<current|newer|older>/<os>/<installer>  "
-          "and  PUT /upload-<current|newer|older>/<os>/<installer>", flush=True)
+    print("targets: " + ", ".join(TARGETS), flush=True)
+    print("plus: /download-<current|newer|older>/<target>  "
+          "and  PUT /upload-<current|newer|older>/<target>", flush=True)
     print(f"uploads to {', '.join(SIGNED_ROLES)} are signed on arrival with "
           f"{CONFIG['cpverify_path']} (container {CONFIG['key_container']}); "
           f"an upload that cannot be signed is rejected", flush=True)

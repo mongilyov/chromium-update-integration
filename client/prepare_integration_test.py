@@ -11,9 +11,13 @@ Targets are the server's: windows, macos, linux_deb, linux_rpm. Each platform kn
 which ones it can handle and defaults to one, so --target is only needed on Linux to
 choose rpm over deb.
 
+On Windows, run from an administrator PowerShell session: preparation removes
+both the current user's and the machine-wide installs. The new baseline is
+per-user by default; pass --system-level for a machine-wide baseline.
+
 Usage:
     python prepare_integration_testing.py [--server <url>]
-        [--target linux_rpm] [--package <path>] [--timeout 120]
+        [--target linux_rpm] [--package <path>] [--timeout 120] [--system-level]
 
 URL can be passed as an environment variable.
 """
@@ -108,32 +112,55 @@ class WindowsPlatform(Platform):
 
     INSTALL_FLAGS = ["--silent", "--do-not-launch-chrome"]
 
+    def __init__(self, target=None, system_level=False):
+        super().__init__(target)
+        self.system_level = system_level
+
+    def scope_flags(self):
+        return ["--system-level"] if self.system_level else []
+
     def remove(self):
+        self._remove_scope(system_level=True)
+        self._remove_scope(system_level=False)
+
+    def _remove_scope(self, system_level):
         import winreg
 
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.UNINSTALL_KEY) as key:
-                uninstall_string, _ = winreg.QueryValueEx(key, self.UNINSTALL_STRING_VALUE)
-                try:
-                    uninstall_args, _ = winreg.QueryValueEx(key, self.UNINSTALL_ARGS_VALUE)
-                except FileNotFoundError:
-                    uninstall_args = ""
-        except FileNotFoundError:
-            print(f"no uninstall entry at HKCU\\{self.UNINSTALL_KEY}; nothing to remove")
+        hive = winreg.HKEY_LOCAL_MACHINE if system_level else winreg.HKEY_CURRENT_USER
+        hive_name = "HKLM" if system_level else "HKCU"
+        # Explicit views make discovery independent of Python's bitness.
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(hive, self.UNINSTALL_KEY, 0,
+                                    winreg.KEY_READ | view) as key:
+                    uninstall_string, _ = winreg.QueryValueEx(key, self.UNINSTALL_STRING_VALUE)
+                    try:
+                        uninstall_args, _ = winreg.QueryValueEx(key, self.UNINSTALL_ARGS_VALUE)
+                    except FileNotFoundError:
+                        uninstall_args = ""
+                break
+            except FileNotFoundError:
+                continue
+        else:
+            print(f"no uninstall entry at {hive_name}\\{self.UNINSTALL_KEY} "
+                  "in either 64-bit or 32-bit registry view; nothing to remove")
             return
 
         command_line = uninstall_string
         if uninstall_args:
             command_line = f"{command_line} {uninstall_args}"
-        if self.UNINSTALL_FLAGS:
-            command_line = f"{command_line} {' '.join(self.UNINSTALL_FLAGS)}"
-        result = self._run(command_line, "uninstall", ok_codes=self.UNINSTALL_OK_CODES)
+        uninstall_flags = self.UNINSTALL_FLAGS + (["--system-level"] if system_level else [])
+        if uninstall_flags:
+            command_line = f"{command_line} {' '.join(uninstall_flags)}"
+        result = self._run(command_line, f"uninstall ({hive_name})",
+                           ok_codes=self.UNINSTALL_OK_CODES)
         if result.returncode != 0:
             print(f"uninstall succeeded with exit {result.returncode} "
                   f"(reboot may be needed to finish removing files)")
 
     def install(self, package_path):
-        self._run([package_path] + self.INSTALL_FLAGS, f"install {package_path}")
+        self._run([package_path] + self.INSTALL_FLAGS + self.scope_flags(),
+                  f"install {package_path}")
 
 
 class MacOSPlatform(Platform):
@@ -180,11 +207,15 @@ PLATFORMS = {
 }
 
 
-def current_platform(target=None):
+def current_platform(target=None, system_level=False):
     system = platform.system()
     platform_class = PLATFORMS.get(system)
     if platform_class is None:
         raise NotImplementedError(f"no platform support for '{system}'")
+    if system == "Windows":
+        return platform_class(target, system_level=system_level)
+    if system_level:
+        raise ValueError("--system-level is only supported on Windows")
     return platform_class(target)
 
 
@@ -215,8 +246,8 @@ def download_baseline(server_url, target, dest_dir, timeout):
     return path
 
 
-def prepare(server_url, target, package, timeout):
-    platform_target = current_platform(target)
+def prepare(server_url, target, package, timeout, system_level=False):
+    platform_target = current_platform(target, system_level=system_level)
     platform_target.require_privileges()
 
     platform_target.remove()
@@ -246,11 +277,15 @@ def main(argv=None):
                         help="install this local package instead of fetching from --server")
     parser.add_argument("--timeout", type=float, default=120.0,
                         help="hard timeout for the baseline download")
+    parser.add_argument("--system-level", action="store_true",
+                        help="Windows: install the baseline system-wide instead of per-user; "
+                             "both scopes are always removed first (requires administrator)")
     args = parser.parse_args(argv)
 
     server_url = normalize_server_url(args.server)
     try:
-        prepare(server_url, args.target, args.package, args.timeout)
+        prepare(server_url, args.target, args.package, args.timeout,
+                system_level=args.system_level)
     except NotImplementedError as error:
         print(f"NOT IMPLEMENTED: {error}", file=sys.stderr)
         return 3

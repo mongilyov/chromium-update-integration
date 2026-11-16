@@ -53,7 +53,7 @@ LINUX_INSTALLERS = ("deb", "rpm")
 TARGETS = ("windows", "macos", "linux_deb", "linux_rpm")
 TARGET_SUFFIX = {
     "windows":   "windows-amd64-installer.exe",
-    "macos":     "macos-arm64.tar.bz2",
+    "macos":     "macos-arm64.tgz",
     "linux_deb": "linux-amd64.deb",
     "linux_rpm": "linux-amd64.rpm",
 }

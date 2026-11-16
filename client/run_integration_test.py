@@ -11,7 +11,10 @@ subclasses; run_case() picks one.
 Usage:
     python run_integration_testing.py --browser <path> --variant ok [--server <url>]
         [--expect-version 999.0.0.0] [--timeout 120] [--poll-interval 1.0]
-        [--relaunch-grace 5.0]
+        [--relaunch-grace 5.0] [--system-level]
+
+On Windows, version checks use the per-user registry hive by default. Pass
+--system-level to check the machine-wide install instead.
 
 URL can be passed as an environment variable.
 """
@@ -178,22 +181,25 @@ class WindowsPlatform(Platform):
     PV_KEY = r"Software\Chromium"
     PV_VALUE = "pv"
 
+    def __init__(self, system_level=False):
+        self.system_level = system_level
+
     def installed_version(self, browser_path):
         import winreg
 
-        hives = [
-            ("HKEY_CURRENT_USER", winreg.HKEY_CURRENT_USER),
-            ("HKEY_LOCAL_MACHINE", winreg.HKEY_LOCAL_MACHINE),
-        ]
-        tried = []
-        for hive_name, hive in hives:
+        hive = winreg.HKEY_LOCAL_MACHINE if self.system_level else winreg.HKEY_CURRENT_USER
+        hive_name = "HKLM" if self.system_level else "HKCU"
+        # Explicit views include WOW6432Node regardless of Python's bitness.
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
             try:
-                with winreg.OpenKey(hive, self.PV_KEY) as key:
+                with winreg.OpenKey(hive, self.PV_KEY, 0, winreg.KEY_READ | view) as key:
                     value, _ = winreg.QueryValueEx(key, self.PV_VALUE)
                     return str(value)
             except FileNotFoundError:
-                tried.append(f"{hive_name}\\{self.PV_KEY}\\{self.PV_VALUE}")
-        raise RuntimeError("registry version not found; tried: " + ", ".join(tried))
+                continue
+        raise RuntimeError(
+            f"registry version not found at {hive_name}\\{self.PV_KEY}\\{self.PV_VALUE} "
+            "in either 64-bit or 32-bit registry view")
 
     def pids_for_executable(self, exe_path):
         import ctypes
@@ -259,11 +265,15 @@ PLATFORMS = {
 }
 
 
-def current_platform():
+def current_platform(system_level=False):
     system = platform.system()
     platform_class = PLATFORMS.get(system)
     if platform_class is None:
         raise NotImplementedError(f"no platform support for '{system}'")
+    if system == "Windows":
+        return platform_class(system_level=system_level)
+    if system_level:
+        raise ValueError("--system-level is only supported on Windows")
     return platform_class()
 
 
@@ -318,8 +328,8 @@ def wait_for_update(target, browser_path, start_version, expect_version, timeout
 
 
 def run_case(browser_path, server_url, variant, expect_version, timeout, poll_interval,
-             relaunch_grace):
-    target = current_platform()
+             relaunch_grace, system_level=False):
+    target = current_platform(system_level=system_level)
 
     start_version = target.read_version(browser_path)
     print(f"version before update: {start_version}")
@@ -376,6 +386,9 @@ def main(argv=None):
                         help="seconds between version polls")
     parser.add_argument("--relaunch-grace", type=float, default=RELAUNCH_GRACE_SECONDS,
                         help="seconds to wait for relaunch before closing the test browser")
+    parser.add_argument("--system-level", action="store_true",
+                        help="Windows: check the machine-wide install version (HKLM) "
+                             "instead of the per-user version (HKCU)")
     args = parser.parse_args(argv)
 
     if not args.server:
@@ -384,10 +397,13 @@ def main(argv=None):
     try:
         return run_case(args.browser, args.server, args.variant,
                         args.expect_version, args.timeout, args.poll_interval,
-                        args.relaunch_grace)
+                        args.relaunch_grace, system_level=args.system_level)
     except NotImplementedError as error:
         print(f"NOT IMPLEMENTED: {error}", file=sys.stderr)
         return 3
+    except ValueError as error:
+        print(f"TEST FAILED: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

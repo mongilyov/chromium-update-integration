@@ -116,7 +116,7 @@ class WindowsPlatform(Platform):
 
     UNINSTALL_FLAGS = ["--force-uninstall"]
 
-    UNINSTALL_OK_CODES = {0, 19}  # Report reboot-required separately; CI cannot continue.
+    UNINSTALL_OK_CODES = {0, 19}  # Continue installing the baseline even if a reboot is requested.
 
     INSTALL_FLAGS = ["--silent", "--do-not-launch-chrome"]
 
@@ -165,8 +165,8 @@ class WindowsPlatform(Platform):
         command_line = " ".join(part for part in parts if part)
         result = self._run(command_line, f"uninstall ({hive_name})",
                            ok_codes=self.UNINSTALL_OK_CODES)
-        if result != 0:
-            raise RuntimeError(f"uninstall requested a reboot (exit {result}); restart the test VM")
+        if result == 19:
+            print("uninstall requested a reboot (exit 19); continuing without reboot", flush=True)
 
     def install(self, package_path):
         flags = self.INSTALL_FLAGS + (["--system-level"] if self.system_level else [])

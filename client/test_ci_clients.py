@@ -147,6 +147,31 @@ class ClientTests(unittest.TestCase):
             prepare.prepare(self.prep_args(package="local.deb"), self.report)
         target.remove.assert_not_called()
 
+    def test_windows_uninstall_reboot_code_continues_through_installation(self):
+        key = Mock()
+        key.__enter__ = Mock(return_value=key)
+        key.__exit__ = Mock(return_value=False)
+        registry = SimpleNamespace(
+            HKEY_LOCAL_MACHINE="machine", HKEY_CURRENT_USER="user",
+            KEY_WOW64_64KEY=64, KEY_WOW64_32KEY=32, KEY_READ=1,
+            OpenKey=Mock(return_value=key),
+            QueryValueEx=Mock(side_effect=lambda key, name:
+                             ('"uninstall.exe"' if name == "UninstallString" else "--uninstall", 1)))
+        target = prepare.WindowsPlatform(log_path=self.directory / "commands.log")
+        with patch.dict(sys.modules, winreg=registry), \
+                patch.object(prepare, "current_platform", return_value=target), \
+                patch.object(target, "require_privileges"), \
+                patch.object(target, "installed_version", return_value=CURRENT) as installed, \
+                patch.object(prepare, "run_command", side_effect=[19, 19, 0]) as command:
+            prepare.prepare(self.prep_args(target="windows", package="baseline.exe",
+                                           expect_version=CURRENT), self.report)
+        self.assertEqual(command.call_count, 3)
+        self.assertIn("--system-level", command.call_args_list[0].args[0])
+        self.assertNotIn("--system-level", command.call_args_list[1].args[0])
+        self.assertEqual(command.call_args.args[0][0], os.path.abspath("baseline.exe"))
+        installed.assert_called_once()
+        self.assertEqual(self.report.data["installed_version"], CURRENT)
+
     def test_linux_query_errors_are_not_treated_as_absent_packages(self):
         with patch.object(prepare, "capture_command", side_effect=RuntimeError("database error")), \
                 self.assertRaisesRegex(RuntimeError, "database error"):

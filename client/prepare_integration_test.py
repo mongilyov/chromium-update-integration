@@ -4,7 +4,8 @@ Prepare a dedicated test VM for an update integration test.
 
 Download the baseline before removing the installed browser, install it,
 then verify the installed version. Run as root on Linux/macOS or administrator
-on Windows. Package dependencies must already be installed/cached on Linux.
+on Windows. APT can use configured repositories for missing dependencies;
+RPM dependencies must already be installed/cached.
 Windows removes both installation scopes; the new baseline is per-user unless
 --system-level is supplied. Use the same Windows account for preparation and test.
 
@@ -77,7 +78,7 @@ class LinuxPlatform(Platform):
     COMMANDS = {
         "linux_deb": (["dpkg-query", "-W", "-f=${Status}"],
                       ["apt-get", "remove", "-y"],
-                      ["apt-get", "install", "-y", "--no-download"]),
+                      ["apt-get", "install", "-y"]),
         "linux_rpm": (["rpm", "-q"], ["dnf", "--cacheonly", "remove", "-y"],
                       ["dnf", "--cacheonly", "install", "-y"]),
     }

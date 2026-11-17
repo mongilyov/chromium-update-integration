@@ -177,6 +177,13 @@ class ClientTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "database error"):
             prepare.LinuxPlatform().remove()
 
+    def test_linux_deb_install_allows_apt_to_acquire_local_package(self):
+        package = os.path.abspath("baseline.deb")
+        target = prepare.LinuxPlatform(log_path=self.directory / "commands.log")
+        with patch.object(prepare, "run_command", return_value=0) as command:
+            target.install(package)
+        self.assertEqual(command.call_args.args[0], ["apt-get", "install", "-y", package])
+
     def test_windows_registry_scope_and_both_views(self):
         key = Mock()
         key.__enter__ = Mock(return_value=key)
@@ -240,6 +247,50 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("<failure>", result["error"])
         self.assertEqual(ET.parse(result_dir / "junit.xml").getroot().attrib["failures"], "1")
+
+    def test_completed_reports_belong_to_sudo_user_on_success_and_failure(self):
+        for code in (0, 1):
+            with self.subTest(code=code):
+                report = common.Report(self.directory, "sudo")
+                (report.directory / "commands.log").write_text("installer output")
+                if code:
+                    (report.directory / "error.log").write_text("installer failed")
+                original_mode = report.directory.stat().st_mode
+                fake_os = SimpleNamespace(name="posix", geteuid=lambda: 0,
+                                          environ={"SUDO_UID": "1000", "SUDO_GID": "1001"},
+                                          chown=Mock())
+                with patch.object(common, "os", fake_os):
+                    report.finish(code, "installer failed" if code else None)
+                calls = fake_os.chown.call_args_list
+                self.assertEqual({call.args[0] for call in calls[:-1]},
+                                 set(report.directory.iterdir()))
+                self.assertEqual(calls[-1].args[0], report.directory)
+                for call in calls:
+                    self.assertEqual(call.args[1:], (1000, 1001))
+                    self.assertEqual(call.kwargs, {"follow_symlinks": False})
+                self.assertEqual(report.directory.stat().st_mode, original_mode)
+
+    def test_report_ownership_is_unchanged_without_sudo_or_on_windows(self):
+        report = common.Report(self.directory, "ordinary")
+        for name, euid, environment in (("nt", 0, {"SUDO_UID": "1000", "SUDO_GID": "1000"}),
+                                        ("posix", 1000, {"SUDO_UID": "1000", "SUDO_GID": "1000"}),
+                                        ("posix", 0, {})):
+            fake_os = SimpleNamespace(name=name, geteuid=lambda: euid,
+                                      environ=environment, chown=Mock())
+            with patch.object(common, "os", fake_os):
+                report._return_to_sudo_user()
+            fake_os.chown.assert_not_called()
+
+    def test_report_ownership_error_keeps_original_result(self):
+        report = common.Report(self.directory, "failed")
+        fake_os = SimpleNamespace(name="posix", geteuid=lambda: 0,
+                                  environ={"SUDO_UID": "1000", "SUDO_GID": "1000"},
+                                  chown=Mock(side_effect=OSError("chown failed")))
+        with patch.object(common, "os", fake_os):
+            report.finish(1, "installer failed")
+        result = json.loads((report.directory / "result.json").read_text())
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["error"], "installer failed")
 
     def test_status_checks_only_selected_platform_and_run_identity(self):
         with patch.object(common, "read_json", return_value=ready_status()):

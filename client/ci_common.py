@@ -215,7 +215,25 @@ class Report:
             ET.SubElement(case, "failure", message=str(error or "failed")).text = str(error or "failed")
         ET.SubElement(case, "system-out").text = f"Logs: {self.directory}"
         ET.ElementTree(suite).write(self.directory / "junit.xml", encoding="utf-8", xml_declaration=True)
+        self._return_to_sudo_user()
         print(f"RESULT: {'PASS' if code == 0 else 'FAIL'}; {self.directory}", flush=True)
+
+    def _return_to_sudo_user(self):
+        if os.name == "nt" or os.geteuid() != 0:
+            return
+        uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+        if uid is None or gid is None:
+            return
+        try:
+            uid, gid = int(uid), int(gid)
+            for path in self.directory.iterdir():
+                if not path.is_symlink() and path.is_file():
+                    os.chown(path, uid, gid, follow_symlinks=False)
+            # Hand over the private directory only after all privileged writes finish.
+            os.chown(self.directory, uid, gid, follow_symlinks=False)
+        except (OSError, ValueError) as error:
+            print(f"WARNING: could not give results to the sudo user: {error}",
+                  file=sys.stderr, flush=True)
 
 
 def run_reported(root, name, action):

@@ -1,37 +1,51 @@
-"""
-run_integration_testing.py
+#!/usr/bin/env python3
+r"""
+Run one browser-update scenario on a dedicated desktop test VM.
 
-Drive the browser through one update scenario and assert the result: launch it to update,
-poll the installed version until it changes, let it relaunch, then close only the browser
-processes running from the browser's own executable path. Does not run the update server.
+Run as the desktop test user (Linux polkit requires an active local session).
+Use --browser for the actual installed executable. A fresh isolated profile is
+created for every case; pre-existing browser processes at that path are rejected.
+The live browser version is read from its local DevTools endpoint, so an installed
+package/registry change alone cannot pass the test. macOS framework cleanup and
+the Current symlink must also settle before success.
 
-Per-OS logic (version read, process lookup, kill, post-relaunch check) lives in Platform
-subclasses; run_case() picks one.
+Versions default to the server /status values. A successful update is the default.
+For corrupt/badjson/http500/truncated/hang, use --expect-no-update: the browser must
+stay healthy throughout --timeout and its NetLog must show the update request.
+Rejection messages are checked for the known error scenarios. Downgrade rejection
+requires --require-log with the expected rejection diagnostic from the browser.
+Logs, result.json and junit.xml remain in the printed results directory.
+The profile is removed after successful cleanup unless --keep-profile is set.
 
-Usage:
-    python run_integration_testing.py --browser <path> --variant ok [--server <url>]
-        [--expect-version 999.0.0.0] [--timeout 120] [--poll-interval 1.0]
-        [--relaunch-grace 5.0] [--system-level]
-
-On Windows, version checks use the per-user registry hive by default. Pass
---system-level to check the machine-wide install instead.
-
-URL can be passed as an environment variable.
+Example:
+    python run_integration_test.py --browser /opt/chromium-gost/chrome \
+        --server http://test-server:8080 --target linux_deb \
+        --expect-current-version 156.0.8078.96 --expect-version 999.0.0.0 \
+        --results-dir /var/tmp/update-results
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import http.client
 import os
+from pathlib import Path
 import platform
-import re
+import plistlib
 import signal
 import subprocess
 import sys
+import shutil
+import tempfile
 import time
+import urllib.parse
 
+from ci_common import (SERVER_ENV_VARIABLE, TARGETS, capture_command, choose_target,
+                       normalize_server_url, parse_version, positive_seconds, read_json,
+                       run_reported, version, version_argument, wait_for_server,
+                       windows_installed_version)
 
-SERVER_ENV_VARIABLE='CHROMIUM_TEST_UPDATE_SERVER_URL'
 
 BROWSER_UPDATE_FLAGS = ["--update-silent", "--update-without-timeout"]
 BROWSER_SERVER_FLAG = "--update-server"
@@ -40,73 +54,65 @@ BROWSER_VERSION_FLAG = "--version"
 RELAUNCH_GRACE_SECONDS = 5.0
 
 
-def parse_version_output(output):
-    match = re.search(r"\d+(?:\.\d+)+", output)
-    return match.group(0) if match else None
-
-
 def _norm_path(path):
-    path = path.strip()
-    if path.endswith(" (deleted)"):
-        path = path[: -len(" (deleted)")]
+    path = path.strip().removesuffix(" (deleted)")
     return os.path.normcase(os.path.realpath(path))
 
 
 def _bundle_path(executable_path):
-    path = os.path.realpath(executable_path)
-    while path not in ("/", ""):
-        if path.endswith(".app"):
-            return path
-        path = os.path.dirname(path)
+    executable = Path(executable_path).resolve()
+    for path in (executable, *executable.parents):
+        if path.suffix == ".app":
+            return str(path)
     raise RuntimeError(f"no .app bundle found above {executable_path}")
 
 
-def start_browser(browser_path, server_url, variant, extra_flags=()):
+def start_browser(browser_path, server_url, variant, profile, report_dir, output, extra_flags=()):
     update_server = f"{server_url.rstrip('/')}/{variant}"
     command = [browser_path, *BROWSER_UPDATE_FLAGS, *extra_flags,
+              "--no-first-run", "--no-default-browser-check",
+              f"--user-data-dir={profile}", "--remote-debugging-port=0",
+              "--remote-debugging-address=127.0.0.1", "--enable-logging",
+              f"--log-file={report_dir / 'chromium.log'}",
+              f"--log-net-log={report_dir / 'netlog.json'}",
               f"{BROWSER_SERVER_FLAG}={update_server}"]
     print(f"launching: {' '.join(command)}", flush=True)
-    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
 
 
 class Platform:
     EXTRA_LAUNCH_FLAGS = []
 
-    def installed_version(self, browser_path):
-        completed = subprocess.run([browser_path, BROWSER_VERSION_FLAG],
-                                   capture_output=True, text=True)
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"'{browser_path} {BROWSER_VERSION_FLAG}' failed: "
-                f"{completed.stderr.strip() or completed.stdout.strip()}")
+    def installed_version(self, browser_path, timeout=10):
+        completed = capture_command([browser_path, BROWSER_VERSION_FLAG], timeout=timeout)
         output = (completed.stdout + completed.stderr).strip()
-        version = parse_version_output(output)
-        if version is None:
+        installed = parse_version(output)
+        if installed is None:
             raise RuntimeError(f"could not parse a version from: {output!r}")
-        return version
+        return installed
 
-    def read_version(self, browser_path):
+    def read_version(self, browser_path, timeout=10):
         try:
-            return self.installed_version(browser_path)
-        except RuntimeError:
+            return self.installed_version(browser_path, timeout)
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
             return None
 
     def pids_for_executable(self, exe_path):
         raise NotImplementedError(f"process lookup not implemented for {type(self).__name__}")
 
-    def close_pids(self, pids):
+    def close_pids(self, pids, browser_path):
         if not pids:
             return
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
+            except ProcessLookupError:
                 pass
         time.sleep(1.0)
-        for pid in pids:
+        for pid in pids & self.pids_for_executable(browser_path):
             try:
                 os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
+            except ProcessLookupError:
                 pass
 
     def post_relaunch_check(self, browser_path, start_version, expect_version):
@@ -122,7 +128,7 @@ class LinuxPlatform(Platform):
                 continue
             try:
                 exe = os.readlink(f"/proc/{entry}/exe")
-            except (OSError, PermissionError):
+            except OSError:
                 continue
             if _norm_path(exe) == wanted:
                 pids.add(int(entry))
@@ -133,14 +139,23 @@ class MacOSPlatform(Platform):
     FRAMEWORK_VERSIONS_SUBPATH = "Contents/Frameworks/Chromium-Gost Framework.framework/Versions"
     EXTRA_LAUNCH_FLAGS = ["--use-mock-keychain", "--disable-features=DialMediaRouteProvider"]
 
+    def installed_version(self, browser_path, timeout=10):
+        info_path = os.path.join(_bundle_path(browser_path), "Contents", "Info.plist")
+        with open(info_path, "rb") as handle:
+            info = plistlib.load(handle)
+        return version(info.get("CFBundleShortVersionString", info.get("CFBundleVersion")))
+
     def pids_for_executable(self, exe_path):
         wanted = _norm_path(exe_path)
-        output = subprocess.run(["ps", "-eo", "pid=,comm="],
-                                capture_output=True, text=True).stdout
+        output = capture_command(["ps", "-eo", "pid=,comm="], timeout=5).stdout
+        bundle = _norm_path(_bundle_path(exe_path)) + os.sep
         pids = set()
         for line in output.splitlines():
             parts = line.split(None, 1)
-            if len(parts) == 2 and _norm_path(parts[1]) == wanted:
+            # Include renderer/helper executables from this app bundle. The
+            # preflight rejects these too, so cleanup cannot adopt an existing app.
+            if len(parts) == 2 and (_norm_path(parts[1]) == wanted
+                                    or _norm_path(parts[1]).startswith(bundle)):
                 try:
                     pids.add(int(parts[0]))
                 except ValueError:
@@ -159,7 +174,7 @@ class MacOSPlatform(Platform):
 
         failures = []
 
-        if start_version and os.path.isdir(os.path.join(versions_dir, start_version)):
+        if os.path.isdir(os.path.join(versions_dir, start_version)):
             failures.append(f"old version folder still present: "
                             f"{os.path.join(versions_dir, start_version)}")
 
@@ -169,37 +184,21 @@ class MacOSPlatform(Platform):
         except OSError as error:
             return failures + [f"could not read Current symlink: {error}"]
 
-        if expect_version is not None and current_target != expect_version:
+        if current_target != expect_version:
             failures.append(f"Current points to {current_target}, expected {expect_version}")
-        elif expect_version is None and start_version is not None and current_target == start_version:
-            failures.append(f"Current still points to the old version {start_version}")
+
+        if not os.path.isdir(current_link):
+            failures.append("Current does not resolve to an existing framework version")
 
         return failures
 
 
 class WindowsPlatform(Platform):
-    PV_KEY = r"Software\Chromium"
-    PV_VALUE = "pv"
-
     def __init__(self, system_level=False):
         self.system_level = system_level
 
-    def installed_version(self, browser_path):
-        import winreg
-
-        hive = winreg.HKEY_LOCAL_MACHINE if self.system_level else winreg.HKEY_CURRENT_USER
-        hive_name = "HKLM" if self.system_level else "HKCU"
-        # Explicit views include WOW6432Node regardless of Python's bitness.
-        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
-            try:
-                with winreg.OpenKey(hive, self.PV_KEY, 0, winreg.KEY_READ | view) as key:
-                    value, _ = winreg.QueryValueEx(key, self.PV_VALUE)
-                    return str(value)
-            except FileNotFoundError:
-                continue
-        raise RuntimeError(
-            f"registry version not found at {hive_name}\\{self.PV_KEY}\\{self.PV_VALUE} "
-            "in either 64-bit or 32-bit registry view")
+    def installed_version(self, browser_path, timeout=10):
+        return windows_installed_version(self.system_level)
 
     def pids_for_executable(self, exe_path):
         import ctypes
@@ -226,7 +225,7 @@ class WindowsPlatform(Platform):
             buffer = (wintypes.DWORD * capacity)()
             needed = wintypes.DWORD()
             if not psapi.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
-                return set()
+                raise ctypes.WinError(ctypes.get_last_error())
             if needed.value < ctypes.sizeof(buffer):
                 found = needed.value // ctypes.sizeof(wintypes.DWORD)
                 break
@@ -250,12 +249,12 @@ class WindowsPlatform(Platform):
                 kernel32.CloseHandle(handle)
         return pids
 
-    def close_pids(self, pids):
-        for pid in pids:
-            try:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
-            except OSError:
-                pass
+    def close_pids(self, pids, browser_path):
+        for pid in pids & self.pids_for_executable(browser_path):
+            # A process can exit between enumeration and taskkill. The caller
+            # re-enumerates afterward; surviving processes fail cleanup.
+            capture_command(["taskkill", "/F", "/PID", str(pid)], timeout=5,
+                            ok_codes=(0, 128))
 
 
 PLATFORMS = {
@@ -277,133 +276,287 @@ def current_platform(system_level=False):
     return platform_class()
 
 
-CLEANUP_VERIFY_DELAY_SECONDS = 0.5
+VARIANTS = ("ok", "corrupt", "downgrade", "badjson", "http500", "truncated", "hang")
+REJECTION_LOGS = {
+    "corrupt": "Failed to verify update integrity",
+    "badjson": "Failed to parse update response",
+    "http500": "Failed to get response from server",
+    "truncated": "Failed to get response from server",
+}
 
 
-def close_browser_at_path(target, browser_path, launched_process):
-    try:
-        pids = target.pids_for_executable(browser_path)
-    except Exception:
-        pids = set()
+def running_browser_version(profile, timeout=2):
+    """Read the live browser's version, tied to this fresh profile's DevTools token."""
+    lines = (Path(profile) / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()
+    if len(lines) != 2 or not lines[0].isdigit() or not lines[1].startswith("/devtools/browser/"):
+        raise RuntimeError("invalid DevToolsActivePort file")
+    port = int(lines[0])
+    if not 1 <= port <= 65535:
+        raise RuntimeError("invalid DevTools port")
+    document = read_json(f"http://127.0.0.1:{port}/json/version", timeout, local=True)
+    endpoint = urllib.parse.urlsplit(document.get("webSocketDebuggerUrl", ""))
+    if (endpoint.scheme != "ws" or endpoint.hostname != "127.0.0.1"
+            or endpoint.port != port or endpoint.path != lines[1]):
+        raise RuntimeError("DevTools endpoint does not belong to the test profile")
+    value = parse_version(document.get("Browser", ""))
+    if value is None:
+        raise RuntimeError("live browser did not report a four-part version")
+    return value
+
+
+def contains_text(paths, text):
+    needle = text.encode("utf-8")
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                tail = b""
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    combined = tail + chunk
+                    if needle in combined:
+                        return True
+                    tail = combined[-max(1, len(needle)):]
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def close_browser_at_path(target, browser_path, launched_process, timeout=10):
+    """The caller refuses pre-existing browsers; all matches belong to this VM test."""
+    deadline = time.monotonic() + timeout
+    failures = []
+    while time.monotonic() < deadline:
+        try:
+            pids = target.pids_for_executable(browser_path)
+            if launched_process.poll() is None:
+                pids.add(launched_process.pid)
+            if not pids:
+                launched_process.wait(timeout=1)  # Reap our direct child.
+                return failures
+            print(f"closing browser pids: {sorted(pids)}", flush=True)
+            target.close_pids(pids, browser_path)
+            if launched_process.poll() is None:
+                launched_process.terminate()
+            time.sleep(0.1)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            failures.append(f"browser cleanup failed: {error}")
+            break
     if launched_process.poll() is None:
-        pids.add(launched_process.pid)
-    if not pids:
-        print(f"no browser processes to close (matched against {_norm_path(browser_path)})")
-        return ["no browser processes found to close -- "
-               "browser may have crashed or failed to relaunch"]
-
-    print(f"closing browser pids at {browser_path}: {sorted(pids)}")
-    target.close_pids(pids)
-
-    time.sleep(CLEANUP_VERIFY_DELAY_SECONDS)
+        launched_process.kill()
+        try:
+            launched_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            failures.append("launched process did not exit after kill")
     try:
         remaining = target.pids_for_executable(browser_path)
-    except Exception:
-        remaining = set()
-    if launched_process.poll() is None:
-        remaining = remaining | {launched_process.pid}
-    still_alive = pids & remaining
-
-    if still_alive:
-        print(f"still running after close: {sorted(still_alive)}")
-        return [f"browser process(es) survived close: {sorted(still_alive)}"]
-    print("confirmed browser closed")
-    return []
+        if remaining:
+            failures.append(f"browser processes survived cleanup: {sorted(remaining)}")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        failures.append(f"cannot verify browser cleanup: {error}")
+    return failures
 
 
-def wait_for_update(target, browser_path, start_version, expect_version, timeout, poll_interval):
-    deadline = time.monotonic() + timeout
-    last_seen = start_version
-    while time.monotonic() < deadline:
-        current = target.read_version(browser_path)
-        if current is not None:
-            last_seen = current
-            if expect_version is not None:
-                if current == expect_version:
-                    return True, current
-            elif current != start_version:
-                return True, current
-        time.sleep(poll_interval)
-    return False, last_seen
+def require_desktop_user():
+    if platform.system() in ("Linux", "Darwin") and os.geteuid() == 0:
+        raise RuntimeError("run the browser test as the desktop test user, not root")
+    if platform.system() == "Linux" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise RuntimeError("a desktop session with DISPLAY or WAYLAND_DISPLAY is required")
 
 
-def run_case(browser_path, server_url, variant, expect_version, timeout, poll_interval,
-             relaunch_grace, system_level=False):
-    target = current_platform(system_level=system_level)
-
-    start_version = target.read_version(browser_path)
-    print(f"version before update: {start_version}")
-
-    process = start_browser(browser_path, server_url, variant, target.EXTRA_LAUNCH_FLAGS)
-    closed = False
+def read_browser_versions(args, target, profile, report, deadline):
+    """Sample the installed version and the browser using this test's profile."""
+    timeout = max(0.01, min(2, deadline - time.monotonic()))
+    installed = target.read_version(args.browser, timeout=timeout)
     try:
-        changed, last_seen = wait_for_update(target, browser_path, start_version,
-                                             expect_version, timeout, poll_interval)
-        print(f"version after update: {last_seen}")
+        running = running_browser_version(profile, timeout=timeout)
+    except (OSError, RuntimeError, ValueError, http.client.HTTPException):
+        running = None
+    previous = (report.data.get("installed_version"), report.data.get("running_version"))
+    if (installed, running) != previous:
+        print(f"observed installed={installed!r}, running={running!r}", flush=True)
+    report.data.update(installed_version=installed, running_version=running)
+    return installed, running
 
-        failures = []
-        if expect_version is not None:
-            if last_seen != expect_version:
-                failures.append(f"expected version {expect_version}, "
-                                f"last saw {last_seen} within {timeout}s")
-        elif not changed:
-            failures.append(f"version never changed from {start_version} within {timeout}s")
 
-        print(f"waiting {relaunch_grace:.1f}s for relaunch...")
-        time.sleep(relaunch_grace)
+def observe_update(args, target, profile, start_version, expected_version, report):
+    """Wait for the installed AND running versions, then for platform cleanup."""
+    deadline = time.monotonic() + args.timeout
+    stable_since = None
+    last_problem = "no version observed"
+    while time.monotonic() < deadline:
+        installed, running = read_browser_versions(args, target, profile, report, deadline)
+        if installed == running == expected_version:
+            problems = target.post_relaunch_check(args.browser, start_version, expected_version)
+        else:
+            problems = [f"installed={installed!r}, running={running!r}"]
+        if problems:
+            last_problem = "; ".join(problems)
+            stable_since = None
+        else:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= args.relaunch_grace:
+                return
+        time.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
+    raise RuntimeError(f"update observation timed out after {args.timeout}s; {last_problem}; "
+                       f"expected running version {expected_version}")
 
-        cleanup_issues = close_browser_at_path(target, browser_path, process)
-        closed = True
-        failures.extend(cleanup_issues)
 
-        check_target = expect_version if expect_version is not None else last_seen
-        failures.extend(target.post_relaunch_check(browser_path, start_version, check_target))
+def observe_no_update(args, target, profile, start_version, report):
+    """Allow startup, then require an unchanged live browser for the full timeout."""
+    startup_deadline = time.monotonic() + min(args.timeout, 30)
+    observation_deadline = None
+    while time.monotonic() < (observation_deadline or startup_deadline):
+        deadline = observation_deadline or startup_deadline
+        installed, running = read_browser_versions(args, target, profile, report, deadline)
+        if installed is not None and installed != start_version:
+            raise RuntimeError(f"unexpected installed version change: {start_version} -> {installed}")
+        if running is not None and running != start_version:
+            raise RuntimeError(f"unexpected running version: {running}")
+        if installed == running == start_version:
+            if observation_deadline is None:
+                observation_deadline = time.monotonic() + args.timeout
+        elif observation_deadline is not None:
+            raise RuntimeError("browser/version became unavailable during the no-update observation")
+        deadline = observation_deadline or startup_deadline
+        time.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
+    if observation_deadline is None:
+        raise RuntimeError("browser did not become ready for the no-update observation")
 
-        if failures:
-            print("\nRESULT: FAIL")
-            for failure in failures:
-                print(f"  - {failure}")
-            return 1
-        print(f"\nRESULT: PASS (version {start_version} -> {last_seen})")
-        return 0
+
+def check_test_setup(args, target, report):
+    """Check arguments, server packages and installed baseline before launching."""
+    if not os.path.isfile(args.browser):
+        raise ValueError(f"browser executable does not exist: {args.browser}")
+    require_desktop_user()
+    if args.variant != "ok" and not args.expect_no_update:
+        raise ValueError("rejection scenarios require --expect-no-update")
+    if args.expect_no_update and args.expect_version is not None:
+        raise ValueError("--expect-version and --expect-no-update are mutually exclusive")
+    args.require_log = args.require_log or REJECTION_LOGS.get(args.variant)
+    if args.expect_no_update and args.variant != "hang" and not args.require_log:
+        raise ValueError("this rejection scenario requires --require-log with its expected error message")
+    if args.relaunch_grace >= args.timeout:
+        raise ValueError("--timeout must be greater than --relaunch-grace")
+
+    role = "older" if args.variant == "downgrade" else "newer"
+    status = wait_for_server(args.server, args.target, args.server_timeout, role=role, run_id=args.run_id)
+    baseline = status["current_version"]
+    expected = baseline if args.expect_no_update else status["newer_version"]
+    if args.expect_current_version not in (None, baseline):
+        raise ValueError("expected baseline does not match the server current_version")
+    if args.expect_version not in (None, expected):
+        raise ValueError("expected update does not match the server newer_version")
+    start = version(target.installed_version(args.browser, timeout=args.command_timeout))
+    report.data.update(target=args.target, variant=args.variant, run_id=status.get("run_id"),
+                       start_version=start, expected_version=expected,
+                       expect_no_update=args.expect_no_update)
+    if start != baseline:
+        raise RuntimeError(f"baseline is {start}, expected {baseline}; run preparation again")
+    if not args.expect_no_update and start == expected:
+        raise RuntimeError("baseline already has the expected update version")
+    existing = target.pids_for_executable(args.browser)
+    if existing:
+        raise RuntimeError(f"browser is already running at this path: {sorted(existing)}")
+    return status
+
+
+@contextmanager
+def browser_session(args, target, report):
+    """Own the fresh profile, browser process and cleanup for one scenario."""
+    profile = Path(tempfile.mkdtemp(prefix="profile-", dir=report.directory))
+    report.data["profile"] = str(profile)
+    process = None
+    cleanup_issues = []
+    try:
+        with open(report.directory / "browser-output.log", "ab", buffering=0) as output:
+            process = start_browser(args.browser, args.server, args.variant, profile,
+                                    report.directory, output, target.EXTRA_LAUNCH_FLAGS)
+            yield profile
     finally:
-        if not closed:
-            close_browser_at_path(target, browser_path, process)
+        if process is not None:
+            try:
+                cleanup_issues = close_browser_at_path(target, args.browser, process)
+            except Exception as error:
+                cleanup_issues = [f"cleanup raised: {error}"]
+        report.data["cleanup_errors"] = cleanup_issues
+        if args.keep_profile or cleanup_issues:
+            print(f"profile preserved: {profile}", flush=True)
+        else:
+            # Remove only the fresh profile owned by this run.
+            resolved = profile.resolve()
+            if resolved.parent != report.directory.resolve() or not resolved.name.startswith("profile-"):
+                raise RuntimeError(f"refusing to remove unexpected profile path: {resolved}")
+            shutil.rmtree(resolved)
+    if cleanup_issues:
+        raise RuntimeError("; ".join(cleanup_issues))
+
+
+def check_logs(args, report):
+    """Check request/error evidence after closing the browser flushes its logs."""
+    if args.expect_no_update:
+        request_url = f"{args.server}/{args.variant}/update"
+        if not contains_text([report.directory / "netlog.json"], request_url):
+            raise RuntimeError("no evidence that the browser attempted the scenario's update request")
+        report.data["update_request_observed"] = True
+    logs = [report.directory / "chromium.log", report.directory / "browser-output.log"]
+    if args.require_log and not contains_text(logs, args.require_log):
+        raise RuntimeError(f"expected browser log message was not observed: {args.require_log!r}")
+
+
+def check_server_unchanged(args, initial_status):
+    role = "older" if args.variant == "downgrade" else "newer"
+    final_status = wait_for_server(args.server, args.target, args.server_timeout, role=role,
+                                   run_id=initial_status.get("run_id"))
+    for field in ("current_version", "newer_version", "older_version", "run_id"):
+        if final_status.get(field) != initial_status.get(field):
+            raise RuntimeError(f"server {field} changed during the test")
+
+
+def run_case(args, report):
+    args.browser = os.path.abspath(args.browser)
+    args.server = normalize_server_url(args.server)
+    args.target = choose_target(args.target)
+    target = current_platform(system_level=args.system_level)
+    status = check_test_setup(args, target, report)
+
+    with browser_session(args, target, report) as profile:
+        if args.expect_no_update:
+            observe_no_update(args, target, profile, status["current_version"], report)
+        else:
+            observe_update(args, target, profile, status["current_version"],
+                           status["newer_version"], report)
+
+    check_logs(args, report)
+    check_server_unchanged(args, status)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Drive the browser through one update scenario.")
-    parser.add_argument("--browser", required=True, help="path to the browser executable")
-    parser.add_argument("--variant", default="ok", help="server variant/role (ok, downgrade, ...)")
-    parser.add_argument("--server", default=os.environ.get(SERVER_ENV_VARIABLE),
-                        help="base URL of the running update server. "
-                        f"Can also be set via {SERVER_ENV_VARIABLE} envrionment variable")
-    parser.add_argument("--expect-version", default=None,
-                        help="if given, wait for exactly this version; else wait for any change")
-    parser.add_argument("--timeout", type=float, default=120.0,
-                        help="hard timeout in seconds for the update to land")
-    parser.add_argument("--poll-interval", type=float, default=1.0,
-                        help="seconds between version polls")
-    parser.add_argument("--relaunch-grace", type=float, default=RELAUNCH_GRACE_SECONDS,
-                        help="seconds to wait for relaunch before closing the test browser")
-    parser.add_argument("--system-level", action="store_true",
-                        help="Windows: check the machine-wide install version (HKLM) "
-                             "instead of the per-user version (HKCU)")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--browser", required=True, help="actual installed browser executable, not a shell launcher")
+    parser.add_argument("--server", default=os.environ.get(SERVER_ENV_VARIABLE))
+    parser.add_argument("--target", choices=TARGETS)
+    parser.add_argument("--variant", choices=VARIANTS, default="ok")
+    parser.add_argument("--expect-current-version", type=version_argument)
+    parser.add_argument("--expect-version", type=version_argument)
+    parser.add_argument("--expect-no-update", action="store_true",
+                        help="observe an unchanged live browser for the entire timeout")
+    parser.add_argument("--require-log", help="required browser error/log text; mandatory for downgrade rejection")
+    parser.add_argument("--timeout", type=positive_seconds, default=180)
+    parser.add_argument("--poll-interval", type=positive_seconds, default=1)
+    parser.add_argument("--relaunch-grace", type=positive_seconds, default=RELAUNCH_GRACE_SECONDS,
+                        help="minimum healthy observation after relaunch (default: 5 seconds)")
+    parser.add_argument("--server-timeout", type=positive_seconds, default=30)
+    parser.add_argument("--command-timeout", type=positive_seconds, default=10)
+    parser.add_argument("--system-level", action="store_true")
+    parser.add_argument("--run-id", help="expected server run_id")
+    parser.add_argument("--results-dir", help="parent for a unique results folder; default: system temp")
+    parser.add_argument("--keep-profile", action="store_true", help="retain the test profile for diagnosis")
     args = parser.parse_args(argv)
-
-    if not args.server:
-        print(f"Server URL is required either as a CLI switch or as an env variable CHROMIUM_TEST_UPDATE_SERVER_URL")
-        return 1
-    try:
-        return run_case(args.browser, args.server, args.variant,
-                        args.expect_version, args.timeout, args.poll_interval,
-                        args.relaunch_grace, system_level=args.system_level)
-    except NotImplementedError as error:
-        print(f"NOT IMPLEMENTED: {error}", file=sys.stderr)
-        return 3
-    except ValueError as error:
-        print(f"TEST FAILED: {error}", file=sys.stderr)
-        return 1
+    return run_reported(args.results_dir, "run-" + args.variant, lambda report: run_case(args, report))
 
 
 if __name__ == "__main__":

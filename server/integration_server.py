@@ -22,9 +22,9 @@ Signing here means that signature metadata is present; the browser still
 performs the actual cryptographic verification. Optional older packages do not
 block readiness for the normal update scenario.
 
-Uploads are staged and signed before publication. Filenames and signatures are
-published together in memory. Uploaded filenames are unique so an old update
-response cannot download a replacement's bytes.
+Uploads are staged and signed before replacing the normally named package.
+The file and its signature are published together. Finish all uploads before
+starting tests; uploading the same version again reuses its download URL.
 
 An explicit --artifacts directory can contain packages in current/, newer/ and
 older/. At startup the server finds packages matching the supplied versions and
@@ -32,7 +32,8 @@ selected targets, then signs existing newer/older packages again. Signatures are
 kept only in memory. Missing packages can be uploaded after startup; ambiguous
 matches cause startup to fail. Manually placed packages use names such as
 newer/chromium-gost-999.0.0.0-linux-amd64.deb. UUID-prefixed uploads from previous
-runs are also recognized. Files for other versions/targets are ignored.
+runs are renamed to normal package names at startup. Files for other
+versions/targets are ignored.
 Do not manually edit packages while the server is serving them, or run
 multiple server processes against the same artifact directory.
 
@@ -66,7 +67,6 @@ import sys
 import tempfile
 import threading
 import urllib.parse
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 OS_VALUES = ("windows", "linux", "macos")
@@ -218,7 +218,6 @@ class ArtifactStore:
             raise ServerError("older version must be less than current version")
         self.lock = threading.RLock()
         self._artifacts = {}
-        self._pending_deletes = set()
         self._temporary_directory = None
         self.temporary = artifacts_dir is None
         if self.temporary:
@@ -251,8 +250,7 @@ class ArtifactStore:
             except FileNotFoundError:
                 continue
             for target in self.targets:
-                # Accept manually placed packages and UUID-prefixed uploads from
-                # previous runs. Never infer a version or select by modification time.
+                # Migrate files uploaded by the previous server without reuploading.
                 canonical = payload_filename(version, target)
                 pattern = re.compile(r"(?:[0-9a-f]{32}-)?" + re.escape(canonical))
                 matches = [name for name in filenames if pattern.fullmatch(name)]
@@ -262,6 +260,10 @@ class ArtifactStore:
                 if not matches:
                     continue
                 filename = matches[0]
+                if filename != canonical:
+                    os.replace(os.path.join(directory, filename),
+                               os.path.join(directory, canonical))
+                    filename = canonical
                 path = os.path.join(directory, filename)
                 artifact = Artifact(version, filename, path, "", "")
                 self._require_payload(artifact)
@@ -316,8 +318,6 @@ class ArtifactStore:
             yield artifact, handle
         finally:
             handle.close()
-            with self.lock:
-                self._remove_obsolete_files()
 
     @contextmanager
     def stage_upload(self, role, target):
@@ -340,28 +340,13 @@ class ArtifactStore:
         if role in SIGNED_ROLES and not _valid_signature(signature, timestamp):
             raise ServerError("refusing to publish an unsigned or invalidly signed update")
         with self.lock:
-            old_artifact = self._artifacts.get((role, target))
-            filename = uuid.uuid4().hex + "-" + payload_filename(version, target)
+            filename = payload_filename(version, target)
             final_path = os.path.join(self.directory, role, filename)
             artifact = Artifact(version, filename, final_path, signature, timestamp)
             os.replace(staged_path, final_path)
             # Publish the bytes and signature together under the same lock used by readers.
             self._artifacts[(role, target)] = artifact
-            if old_artifact is not None:
-                self._pending_deletes.add(old_artifact.path)
-            self._remove_obsolete_files()
             return filename
-
-    def _remove_obsolete_files(self):
-        for path in tuple(self._pending_deletes):
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # Windows keeps an active download's file open. Retry on close.
-                continue
-            self._pending_deletes.discard(path)
 
     def status(self, run_id=None):
         with self.lock:
@@ -385,7 +370,6 @@ class ArtifactStore:
 
     def close(self):
         with self.lock:
-            self._remove_obsolete_files()
             if self._temporary_directory is not None:
                 self._temporary_directory.cleanup()
                 self._temporary_directory = None

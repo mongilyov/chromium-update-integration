@@ -183,30 +183,28 @@ class ServerTests(unittest.TestCase):
             document = self.update(instance, target=target)
             self.assertEqual(document["signature"], signature(data))
             self.assertEqual(self.request(instance, document["download_url"])[2], data)
+            self.assertEqual(urlsplit(document["download_url"]).path.rsplit("/", 1)[1],
+                             server.payload_filename(NEWER, target))
+            self.assertTrue(Path(instance.store.directory, "current",
+                                 server.payload_filename(CURRENT, target)).is_file())
         self.assertTrue(self.status(instance)["ready"])
         self.assert_no_staging(instance)
 
-    def test_replacement_invalidates_old_url_and_removes_old_file(self):
+    def test_replacement_reuses_normal_filename_and_updates_signature(self):
         instance = self.make_server()
         self.upload(instance, "newer", b"old package")
         first = self.update(instance)
-        old_path = Path(instance.store.directory, "newer",
-                        urlsplit(first["download_url"]).path.rsplit("/", 1)[1])
+        path = Path(instance.store.directory, "newer",
+                    server.payload_filename(NEWER, "linux_deb"))
+        self.assertEqual(path.read_bytes(), b"old package")
         self.upload(instance, "newer", b"replacement")
         second = self.update(instance)
-        self.assertNotEqual(first["download_url"], second["download_url"])
-        self.assertEqual(self.request(instance, first["download_url"])[0], 404)
+        self.assertEqual(first["download_url"], second["download_url"])
         self.assertEqual(self.request(instance, second["download_url"])[2], b"replacement")
-        self.assertFalse(old_path.exists())
-
-    def test_active_download_retains_its_bytes_across_replacement(self):
-        instance = self.make_server()
-        self.upload(instance, "newer", b"old package")
-        with instance.store.open_payload("newer", "linux_deb", signed=True) as (old, handle):
-            self.upload(instance, "newer", b"replacement")
-            self.assertEqual(handle.read(), b"old package")
-        self.assertFalse(Path(old.path).exists())
-        self.assertEqual(self.request(instance, "/download-newer/linux_deb")[2], b"replacement")
+        self.assertEqual(path.read_bytes(), b"replacement")
+        self.assertEqual(second["signature"], signature(b"replacement"))
+        self.assertNotEqual(first["signature"], second["signature"])
+        self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_signing_failure_preserves_published_pair(self):
         instance = self.make_server()
@@ -438,7 +436,7 @@ class ServerTests(unittest.TestCase):
             instance = self.make_server(artifacts_dir=directory)
             try:
                 self.upload(instance, "newer", b"replacement")
-                self.assertFalse(original.exists())
+                self.assertEqual(original.read_bytes(), b"replacement")
             finally:
                 instance.stop()
             restarted = self.make_server(artifacts_dir=directory)
@@ -446,6 +444,25 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(self.request(restarted, "/download-newer/linux_deb")[2], b"replacement")
             finally:
                 restarted.stop()
+
+    def test_legacy_prefixed_packages_are_renamed_on_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for role, version in (("current", CURRENT), ("newer", NEWER)):
+                path = self.write_package(directory, role, version, role.encode())
+                path.rename(path.with_name("a" * 32 + "-" + path.name))
+            instance = self.make_server(artifacts_dir=directory)
+            try:
+                self.assertTrue(self.status(instance)["ready"])
+                for role, version in (("current", CURRENT), ("newer", NEWER)):
+                    path = Path(directory, role, server.payload_filename(version, "linux_deb"))
+                    self.assertEqual(list(path.parent.iterdir()), [path])
+                    self.assertEqual(path.read_bytes(), role.encode())
+                    self.assertEqual(self.request(instance, f"/download-{role}/linux_deb")[2],
+                                     role.encode())
+                instance.test_signer.assert_called_once_with(
+                    str(Path(directory, "newer", server.payload_filename(NEWER, "linux_deb"))))
+            finally:
+                instance.stop()
 
     def test_other_versions_targets_and_disabled_older_are_ignored(self):
         with tempfile.TemporaryDirectory() as directory:
